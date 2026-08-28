@@ -35,9 +35,7 @@ Raw files under `data/` are input-only and are never modified.
 
 ## Parallelism and scan subsampling
 
-Use `--workers` to process disjoint MS1-frame chunks in separate processes.
-Each worker returns a private `(charge, 1/K0 bin, m/z bin)` intensity tensor;
-the parent sums them deterministically. Use `--scans-per-mobility-bin N` to
+Use `--threads` to set Numba CPU parallelism (default: 3; at most three threads are useful). Every MS1 frame is processed by one Numba parallel function with one task per charge. Each task owns its complete disjoint `(charge, 1/K0 bin, m/z bin)` plane and writes directly to the final intensity tensor. Scan-to-1/K0-bin assignments are evaluated once with OpenTIMS for the first MS1 frame and reused thereafter. Use `--scans-per-mobility-bin N` to
 select `N` evenly spaced scans in each populated 1/K0 bin of every MS1 frame.
 `0` (the default) processes all scans. When subsampling, divide each mobility
 row by `sampled_scans_per_mobility_bin` before comparing intensities between

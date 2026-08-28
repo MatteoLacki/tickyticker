@@ -29,6 +29,7 @@ their configurability.
 ## Implementation conventions
 
 - Use OpenTIMS, NumPy, and Numba for raw-data processing.
+- Parallelize each MS1 frame with Numba over its three exclusive charge planes; do not add a separate process-worker layer. Determine scan-to-1/K0-bin assignments once from the first MS1 frame with OpenTIMS, then reuse that lookup for every frame.
 - Process frames one at a time; never load all raw data into memory.
 - Bruker `.d` peak arrays are frame-scan-TOF sorted; rely on that ordering rather than re-sorting frames.
 - Use calibrated `mz` and `inv_ion_mobility` coordinates in outputs.
