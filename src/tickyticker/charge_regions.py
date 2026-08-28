@@ -74,19 +74,6 @@ def _ms1_frames(dataset: OpenTIMS) -> Iterator[dict[str, np.ndarray]]:
     yield from dataset.query_iter(dataset.ms1_frames, columns=_COLUMNS)
 
 
-def _mobility_limits(dataset: OpenTIMS) -> tuple[float, float]:
-    """Find MS1 1/K0 bounds without retaining frame data."""
-    lower, upper = np.inf, -np.inf
-    for frame in _ms1_frames(dataset):
-        mobility = frame["inv_ion_mobility"]
-        if mobility.size:
-            lower = min(lower, float(np.min(mobility)))
-            upper = max(upper, float(np.max(mobility)))
-    if not np.isfinite(lower) or lower >= upper:
-        raise RuntimeError("No usable inverse-ion-mobility values were found in MS1 frames.")
-    return lower, upper
-
-
 def _accumulate_frame(
     frame: dict[str, np.ndarray],
     counts: np.ndarray,
@@ -161,7 +148,14 @@ def analyse(
         opentimspy.setup_opensource()
 
     with OpenTIMS(dataset_path) as dataset:
-        mobility_min, mobility_max = _mobility_limits(dataset)
+        ms1_frames = np.asarray(dataset.ms1_frames, dtype=np.uint32)
+        if not ms1_frames.size:
+            raise RuntimeError("No MS1 frames were found.")
+        scan_bounds = np.array([dataset.min_scan, dataset.max_scan], dtype=np.uint32)
+        reference_frames = np.full(2, ms1_frames[0], dtype=np.uint32)
+        mobility_min, mobility_max = np.sort(
+            dataset.scan_to_inv_ion_mobility(scan_bounds, reference_frames)
+        )
         mobility_edges = np.linspace(mobility_min, mobility_max, mobility_bins + 1)
         shape = (len(CHARGES), mobility_bins, mz_edges.size - 1)
         counts = np.zeros(shape, dtype=np.uint32)
