@@ -30,6 +30,7 @@ their configurability.
 
 - Use OpenTIMS, NumPy, and Numba for raw-data processing.
 - Process frames one at a time; never load all raw data into memory.
+- Bruker `.d` peak arrays are frame-scan-TOF sorted; rely on that ordering rather than re-sorting frames.
 - Use calibrated `mz` and `inv_ion_mobility` coordinates in outputs.
 - Preserve independent maps for all charge states unless explicitly asked to
   collapse them.

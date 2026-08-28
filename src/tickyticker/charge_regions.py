@@ -97,8 +97,7 @@ def _accumulate_frame(
     if not mz.size:
         return
 
-    order = np.lexsort((mz, scan))
-    scan, mz, intensity, mobility = scan[order], mz[order], intensity[order], mobility[order]
+    # Bruker .d peak data are frame-scan-TOF sorted; m/z is monotonic with TOF.
     starts = np.flatnonzero(np.r_[True, scan[1:] != scan[:-1]])
     stops = np.r_[starts[1:], scan.size]
     mobility_bin_count, mz_bin_count = counts.shape[1:]
@@ -110,7 +109,7 @@ def _accumulate_frame(
         if not candidate_mz.size:
             continue
 
-        scan_mobility = float(np.median(mobility[start:stop]))
+        scan_mobility = float(mobility[start])
         mobility_bin = int(
             np.floor((scan_mobility - mobility_min) / (mobility_max - mobility_min) * mobility_bin_count)
         )
