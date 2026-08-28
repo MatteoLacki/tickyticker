@@ -22,7 +22,7 @@ defined only in `pyproject.toml`.
 
 `charge-regions` iterates MS1 frames with OpenTIMS, finds local m/z maxima in
 each scan, tests isotope continuations for charges 1–3 at spacings 1, 1/2, and
-1/3 Da, and writes separate charge maps using 1 Da m/z bins and 10 equal-width
+1/3 Da, and writes separate charge maps using 1 Da m/z bins and 100 equal-width
 1/K0 bins. Defaults are 10 ppm and three following isotope positions; preserve
 their configurability.
 

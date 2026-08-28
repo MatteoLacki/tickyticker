@@ -129,7 +129,7 @@ def analyse(
     *,
     ppm: float = 10.0,
     isotope_count: int = 3,
-    mobility_bins: int = 10,
+    mobility_bins: int = 100,
     mz_min: float = 100.0,
     mz_max: float = 1700.0,
     min_intensity: float = 0.0,
@@ -222,7 +222,7 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--ppm", type=float, default=10.0)
     parser.add_argument("--isotope-count", type=int, default=3)
-    parser.add_argument("--mobility-bins", type=int, default=10)
+    parser.add_argument("--mobility-bins", type=int, default=100)
     parser.add_argument("--mz-min", type=float, default=100.0)
     parser.add_argument("--mz-max", type=float, default=1700.0)
     parser.add_argument("--min-intensity", type=float, default=0.0)
