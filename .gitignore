@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.nbc
+*.nbi
+*.egg-info/
+
+# Raw instrument data and generated analysis products are local artifacts.
+data/
+charge_regions_*/
