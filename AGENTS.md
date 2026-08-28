@@ -33,7 +33,7 @@ their configurability.
 - Use calibrated `mz` and `inv_ion_mobility` coordinates in outputs.
 - Preserve independent maps for all charge states unless explicitly asked to
   collapse them.
-- Save numerical results as `.npz` and generate a readable PNG plot.
+- Save numerical results as `.npz`, plus both PNG and ASCII dominant-charge views.
 - Record runtime and exact parameters for every full dataset run.
 
 ## Validation

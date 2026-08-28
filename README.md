@@ -28,6 +28,7 @@ Each run writes:
 
 - `charge_region_maps.npz`: separate count and normalized-score maps for
   charges 1, 2, and 3, with m/z and 1/K0 bin edges;
-- `charge_region_counts.png`: a three-panel charge-count heatmap.
+- `charge_region_counts.png`: a three-panel charge-count heatmap;
+- `dominant_charge_map.png` and `dominant_charge_map.txt`: the charge with the highest count per box, as a categorical plot and ASCII map.
 
 Raw files under `data/` are input-only and are never modified.

@@ -15,6 +15,8 @@ import opentimspy
 from numba import njit
 from opentimspy import OpenTIMS
 
+from .dominant_charge import dominant_charge_map, plot_dominant_charge_map, write_ascii_map
+
 
 CHARGES = np.array([1, 2, 3], dtype=np.int64)
 _COLUMNS = ("scan", "mz", "intensity", "inv_ion_mobility")
@@ -183,6 +185,9 @@ def analyse(
         min_score=np.array(min_score),
     )
     _plot_maps(counts, mz_edges, mobility_edges, output_dir / "charge_region_counts.png")
+    dominant = dominant_charge_map(counts)
+    write_ascii_map(dominant, mz_edges, mobility_edges, output_dir / "dominant_charge_map.txt")
+    plot_dominant_charge_map(dominant, mz_edges, mobility_edges, output_dir / "dominant_charge_map.png")
     return npz_path
 
 
