@@ -3,7 +3,7 @@
 `tickyticker` maps isotope-spacing evidence for charge states 1–3 in Bruker
 timsTOF MS1 data. It reads `.d` directories frame-by-frame with OpenTIMS,
 detects local m/z maxima within each scan, and aggregates successful isotope
-continuations into m/z × inverse-ion-mobility (1/K0) count maps.
+continuations into one 3D charge-resolved precursor-intensity map.
 
 ## Install
 
@@ -26,9 +26,19 @@ are required. Use `charge-regions --help` to view all parameters.
 
 Each run writes:
 
-- `charge_region_maps.npz`: separate count and normalized-score maps for
-  charges 1, 2, and 3, with m/z and 1/K0 bin edges;
-- `charge_region_counts.png`: a three-panel charge-count heatmap;
-- `dominant_charge_map.png` and `dominant_charge_map.txt`: the charge with the highest count per box, as a categorical plot and ASCII map.
+- `charge_region_maps.npz`: one `(charge, 1/K0 bin, m/z bin)` intensity tensor, with m/z and 1/K0 bin edges;
+- `charge_region_intensities.png`: a three-panel charge-resolved intensity heatmap;
+- `dominant_charge_map.png` and `dominant_charge_map.txt`: the charge with the highest summed intensity per box, as a categorical plot and ASCII map.
+- `sampled_scans_per_mobility_bin`: exposure for normalizing intensity maps produced with scan subsampling.
 
 Raw files under `data/` are input-only and are never modified.
+
+## Parallelism and scan subsampling
+
+Use `--workers` to process disjoint MS1-frame chunks in separate processes.
+Each worker returns a private `(charge, 1/K0 bin, m/z bin)` intensity tensor;
+the parent sums them deterministically. Use `--scans-per-mobility-bin N` to
+select `N` evenly spaced scans in each populated 1/K0 bin of every MS1 frame.
+`0` (the default) processes all scans. When subsampling, divide each mobility
+row by `sampled_scans_per_mobility_bin` before comparing intensities between
+runs.

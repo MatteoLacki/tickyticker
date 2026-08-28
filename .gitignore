@@ -8,3 +8,4 @@ __pycache__/
 # Raw instrument data and generated analysis products are local artifacts.
 data/
 charge_regions_*/
+charge_intensity_*/
