@@ -19,6 +19,7 @@ dependencies = [
 dev = ["matplotlib>=3.8"]
 [project.scripts]
 charge-regions = "tickyticker.charge_regions:main"
+below-line-tic = "tickyticker.charge_regions:tic_main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }

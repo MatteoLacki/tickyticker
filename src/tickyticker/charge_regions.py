@@ -5,6 +5,7 @@ from __future__ import annotations
 from time import perf_counter
 
 import argparse
+import json
 from itertools import chain
 from pathlib import Path
 
@@ -46,6 +47,7 @@ def _process_ms1_frame(
     touched_bins: np.ndarray,
     isotope_count: int,
     min_intensity: float,
+    fine_bins_per_output_mz_bin: int,
 ) -> None:
     """Bin and classify one frame in parallel over exclusive mobility slices."""
     if scan.size == 0:
@@ -96,7 +98,7 @@ def _process_ms1_frame(
             for touched_index in range(touched_count):
                 fine_mz_bin = touched[touched_index]
                 precursor_intensity = spectrum[fine_mz_bin]
-                output_mz_bin = fine_mz_bin // 12
+                output_mz_bin = fine_mz_bin // fine_bins_per_output_mz_bin
                 all_ms1_intensities[mobility_bin, output_mz_bin] += precursor_intensity
                 if precursor_intensity < min_intensity:
                     continue
@@ -122,98 +124,225 @@ def _process_ms1_frame(
                 spectrum[touched[touched_index]] = 0
 
 
-@njit(cache=True, parallel=True)
-def _best_mz_splits(
-    intensities: np.ndarray, mz_start_index: int, mz_stop_index: int
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Find class-balanced 1+ left and 1+ right m/z splits for each mobility row."""
-    mobility_bin_count = intensities.shape[1]
-    mz_bin_count = intensities.shape[2]
-    if mz_start_index < 0 or mz_stop_index > mz_bin_count or mz_start_index >= mz_stop_index:
-        raise ValueError("m/z split limits must select at least one m/z bin.")
-    left_splits = np.zeros(mobility_bin_count, dtype=np.int64)
-    left_scores = np.zeros(mobility_bin_count, dtype=np.float64)
-    right_splits = np.zeros(mobility_bin_count, dtype=np.int64)
-    right_scores = np.zeros(mobility_bin_count, dtype=np.float64)
-    for mobility_bin in prange(mobility_bin_count):
-        total_one = 0.0
-        total_other = 0.0
-        for mz_bin in range(mz_start_index, mz_stop_index):
-            total_one += intensities[0, mobility_bin, mz_bin]
-            total_other += intensities[1, mobility_bin, mz_bin] + intensities[2, mobility_bin, mz_bin]
-
-        if total_one == 0.0 or total_other == 0.0:
-            continue
-
-        cumulative_one = 0.0
-        cumulative_other = 0.0
-        best_left_score = 1.0
-        best_right_score = 1.0
-        best_left_split = mz_start_index
-        best_right_split = mz_start_index
-        for split in range(mz_start_index + 1, mz_stop_index + 1):
-            mz_bin = split - 1
-            cumulative_one += intensities[0, mobility_bin, mz_bin]
-            cumulative_other += intensities[1, mobility_bin, mz_bin] + intensities[2, mobility_bin, mz_bin]
-            left_score = cumulative_one / total_one + (total_other - cumulative_other) / total_other
-            right_score = (total_one - cumulative_one) / total_one + cumulative_other / total_other
-            if left_score > best_left_score:
-                best_left_score = left_score
-                best_left_split = split
-            if right_score > best_right_score:
-                best_right_score = right_score
-                best_right_split = split
-        left_splits[mobility_bin] = best_left_split
-        left_scores[mobility_bin] = best_left_score
-        right_splits[mobility_bin] = best_right_split
-        right_scores[mobility_bin] = best_right_score
-    return left_splits, left_scores, right_splits, right_scores
+def _robust_line_fit(mz: np.ndarray, mobility: np.ndarray, weights: np.ndarray) -> np.ndarray:
+    """Fit mobility = intercept + slope*mz by weighted Huber IRLS."""
+    design = np.column_stack((np.ones(mz.size), mz))
+    current_weights = weights.copy()
+    coefficients = np.zeros(2, dtype=np.float64)
+    for _ in range(30):
+        previous = coefficients.copy()
+        sqrt_weights = np.sqrt(current_weights)
+        coefficients = np.linalg.lstsq(
+            design * sqrt_weights[:, None], mobility * sqrt_weights, rcond=None
+        )[0]
+        residual = mobility - design @ coefficients
+        median = np.median(residual)
+        scale = max(1.4826 * np.median(np.abs(residual - median)), 1e-8)
+        scaled = np.abs(residual) / (1.345 * scale)
+        huber_weights = np.minimum(1.0, 1.0 / np.maximum(scaled, 1.0))
+        current_weights = weights * huber_weights
+        if np.max(np.abs(coefficients - previous)) < 1e-10:
+            break
+    return coefficients
 
 
-def _linear_spline_design(x: np.ndarray, knots: np.ndarray) -> np.ndarray:
-    """Return a truncated-linear basis, which extrapolates linearly at both ends."""
-    design = np.empty((x.size, knots.size), dtype=np.float64)
-    design[:, 0] = 1.0
-    design[:, 1] = x
-    for knot_index in range(2, knots.size):
-        design[:, knot_index] = np.maximum(0.0, x - knots[knot_index - 1])
-    return design
+def _best_polar_radius(
+    radius: np.ndarray, one_charge: np.ndarray
+) -> tuple[float, float, float, float]:
+    """Return class-balanced inner-1+ and outer-1+ radial thresholds and scores."""
+    order = np.argsort(radius)
+    radius = radius[order]
+    one_charge = one_charge[order]
+    total_one = float(one_charge.sum())
+    total_other = float(one_charge.size - one_charge.sum())
+    if total_one == 0.0 or total_other == 0.0 or radius.size < 2:
+        return np.nan, 0.0, np.nan, 0.0
+    one_left = np.cumsum(one_charge)
+    other_left = np.cumsum(~one_charge)
+    inner_scores = one_left[:-1] / total_one + (total_other - other_left[:-1]) / total_other
+    outer_scores = other_left[:-1] / total_other + (total_one - one_left[:-1]) / total_one
+    inner_index = int(np.argmax(inner_scores))
+    outer_index = int(np.argmax(outer_scores))
+    inner_radius = (radius[inner_index] + radius[inner_index + 1]) / 2.0
+    outer_radius = (radius[outer_index] + radius[outer_index + 1]) / 2.0
+    return inner_radius, float(inner_scores[inner_index]), outer_radius, float(outer_scores[outer_index])
 
 
-def fit_linear_spline_charge_border(
+def fit_polar_charge_border(
     intensities: np.ndarray,
+    all_ms1_intensities: np.ndarray,
     mz_edges: np.ndarray,
     mobility_edges: np.ndarray,
-    point_weights: np.ndarray,
-    mz_start_index: int,
-    mz_stop_index: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, bool]:
-    """Fit a raw-intensity-weighted spline through class-balanced row splits."""
-    left_splits, left_scores, right_splits, right_scores = _best_mz_splits(
-        intensities, mz_start_index, mz_stop_index
-    )
-    one_left = left_scores.sum() >= right_scores.sum()
-    split_indices = left_splits if one_left else right_splits
-    scores = left_scores if one_left else right_scores
+    border_mz_left: float,
+    border_mz_right: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, np.ndarray, bool, np.ndarray]:
+    """Fit robust 1+/2+ axes then one class-balanced polar radial boundary."""
+    dominant = dominant_charge_map(intensities)
+    mz_centers = (mz_edges[:-1] + mz_edges[1:]) / 2.0
     mobility_centers = (mobility_edges[:-1] + mobility_edges[1:]) / 2.0
-    split_mz = mz_edges[split_indices]
-    if point_weights.shape != scores.shape:
-        raise ValueError("point_weights must contain one total-intensity weight per mobility bin.")
-    one_evidence = intensities[0, :, mz_start_index:mz_stop_index].sum(axis=1)
-    other_evidence = intensities[1:, :, mz_start_index:mz_stop_index].sum(axis=(0, 2))
-    valid = (scores > 0) & (point_weights > 0) & (one_evidence > 0) & (other_evidence > 0)
-    valid_count = np.count_nonzero(valid)
-    if valid_count < 3:
-        raise RuntimeError("At least three mobility bins with both 1+ and 2+/3+ evidence are required.")
+    considered = (mz_centers >= border_mz_left) & (mz_centers <= border_mz_right)
+    interior = (mz_centers >= border_mz_left + 3.0) & (mz_centers <= border_mz_right - 3.0)
+    grid_mz, grid_mobility = np.meshgrid(mz_centers, mobility_centers)
+    point_weights = np.maximum(all_ms1_intensities, 1.0)
 
-    knot_count = max(2, int(np.ceil(valid_count / 10.0)))
-    knots = np.linspace(mobility_centers[valid].min(), mobility_centers[valid].max(), knot_count)
-    design = _linear_spline_design(mobility_centers[valid], knots)
-    sqrt_weights = np.sqrt(point_weights[valid])
-    coefficients = np.linalg.lstsq(design * sqrt_weights[:, None], split_mz[valid] * sqrt_weights, rcond=None)[0]
-    fitted_mz = _linear_spline_design(mobility_centers, knots) @ coefficients
-    return split_indices, split_mz, scores, valid, knots, coefficients, fitted_mz, one_left
+    line_coefficients = []
+    for charge in (1, 2):
+        line_mask = (dominant == charge) & interior[None, :]
+        if np.count_nonzero(line_mask) < 3:
+            raise RuntimeError(f"At least three uncensored dominant {charge}+ cells are required for polar fitting.")
+        line_coefficients.append(
+            _robust_line_fit(grid_mz[line_mask], grid_mobility[line_mask], point_weights[line_mask])
+        )
+    line_one, line_two = line_coefficients
+    slope_difference = line_one[1] - line_two[1]
+    if abs(slope_difference) < 1e-10:
+        raise RuntimeError("Robust 1+ and 2+ axes are effectively parallel; polar origin is undefined.")
+    origin_mz = (line_two[0] - line_one[0]) / slope_difference
+    origin_mobility = line_one[0] + line_one[1] * origin_mz
 
+    cloud_mask = ((dominant == 1) | (dominant == 2)) & considered[None, :]
+    cloud_mz = grid_mz[cloud_mask]
+    cloud_mobility = grid_mobility[cloud_mask]
+    cloud_one = dominant[cloud_mask] == 1
+    radius = np.hypot(cloud_mz - origin_mz, cloud_mobility - origin_mobility)
+    inner_radius, inner_score, outer_radius, outer_score = _best_polar_radius(radius, cloud_one)
+    if not np.isfinite(inner_radius) or not np.isfinite(outer_radius):
+        raise RuntimeError("Both dominant 1+ and 2+ cells are required for the polar split.")
+    one_inner = inner_score >= outer_score
+    boundary_radius = inner_radius if one_inner else outer_radius
+
+    grid_radius = np.hypot(grid_mz - origin_mz, grid_mobility - origin_mobility)
+    one_mask = grid_radius <= boundary_radius if one_inner else grid_radius >= boundary_radius
+    one_mask &= considered[None, :]
+    boundary_angles = np.linspace(-np.pi, np.pi, 721)
+    boundary = np.stack((
+        origin_mz + boundary_radius * np.cos(boundary_angles),
+        origin_mobility + boundary_radius * np.sin(boundary_angles),
+    ))
+    origin = np.array([origin_mz, origin_mobility])
+    return origin, line_one, line_two, boundary_radius, boundary, one_inner, one_mask
+
+
+
+def fit_alpha_separator_line(
+    intensities: np.ndarray,
+    all_ms1_intensities: np.ndarray,
+    mz_edges: np.ndarray,
+    mobility_edges: np.ndarray,
+    border_mz_left: float,
+    border_mz_right: float,
+) -> tuple[float, float, float, np.ndarray, np.ndarray]:
+    """Fit the original-coordinate line from robust 1+/2+ axes and alpha overlap."""
+    dominant = dominant_charge_map(intensities)
+    mz_centers = (mz_edges[:-1] + mz_edges[1:]) / 2.0
+    mobility_centers = (mobility_edges[:-1] + mobility_edges[1:]) / 2.0
+    interior = (mz_centers >= border_mz_left + 3.0) & (mz_centers <= border_mz_right - 3.0)
+    considered = (mz_centers >= border_mz_left) & (mz_centers <= border_mz_right)
+    grid_mz, grid_mobility = np.meshgrid(mz_centers, mobility_centers)
+    weights = np.maximum(all_ms1_intensities, 1.0)
+    lines = []
+    for charge in (1, 2):
+        mask = (dominant == charge) & interior[None, :]
+        if np.count_nonzero(mask) < 3:
+            raise RuntimeError(f"At least three uncensored dominant {charge}+ cells are required for line fitting.")
+        lines.append(_robust_line_fit(grid_mz[mask], grid_mobility[mask], weights[mask]))
+    line_one, line_two = lines
+    slope_difference = line_one[1] - line_two[1]
+    if abs(slope_difference) < 1e-10:
+        raise RuntimeError("Robust 1+ and 2+ axes are effectively parallel; line origin is undefined.")
+    origin_mz = (line_two[0] - line_one[0]) / slope_difference
+    origin_mobility = line_one[0] + line_one[1] * origin_mz
+    cloud = ((dominant == 1) | (dominant == 2)) & considered[None, :]
+    alpha = np.arctan2(grid_mobility[cloud] - origin_mobility, grid_mz[cloud] - origin_mz)
+    one = dominant[cloud] == 1
+    if not np.any(one) or np.all(one):
+        raise RuntimeError("Both dominant 1+ and 2+ cells are required for alpha line fitting.")
+    alpha_one = np.quantile(alpha[one], (0.05, 0.95))
+    alpha_two = np.quantile(alpha[~one], (0.05, 0.95))
+    lower, upper = max(alpha_one[0], alpha_two[0]), min(alpha_one[1], alpha_two[1])
+    # A gap is an even cleaner separation than an overlap; its midpoint remains the border.
+    separator_alpha = (lower + upper) / 2.0
+    slope = float(np.tan(separator_alpha))
+    if not np.isfinite(slope):
+        raise RuntimeError("Alpha separator is vertical and cannot be represented as mobility = intercept + slope*mz.")
+    intercept = float(origin_mobility - slope * origin_mz)
+    return intercept, slope, float(separator_alpha), np.array((origin_mz, origin_mobility)), np.stack((line_one, line_two))
+
+
+@njit(cache=True, parallel=True)
+def _sum_below_line_frame(
+    scan: np.ndarray,
+    tof: np.ndarray,
+    intensity: np.ndarray,
+    scan_mobility: np.ndarray,
+    fine_mz_tof_edges: np.ndarray,
+    fine_mz_centers: np.ndarray,
+    intercept: float,
+    slope: float,
+    partial_tic: np.ndarray,
+) -> None:
+    """Sum raw event intensity below a line, in parallel over scans."""
+    if scan.size == 0:
+        return
+    starts = np.full(scan_mobility.size, -1, dtype=np.int64)
+    stops = np.full(scan_mobility.size, -1, dtype=np.int64)
+    previous_scan = scan[0]
+    starts[previous_scan] = 0
+    for peak_index in range(1, scan.size):
+        current_scan = scan[peak_index]
+        if current_scan != previous_scan:
+            stops[previous_scan] = peak_index
+            starts[current_scan] = peak_index
+            previous_scan = current_scan
+    stops[previous_scan] = scan.size
+    for scan_number in prange(scan_mobility.size):
+        start = starts[scan_number]
+        if start < 0:
+            continue
+        total = np.uint64(0)
+        for peak_index in range(start, stops[scan_number]):
+            fine_bin = np.searchsorted(fine_mz_tof_edges, tof[peak_index], side="right") - 1
+            if 0 <= fine_bin < fine_mz_centers.size:
+                if scan_mobility[scan_number] < intercept + slope * fine_mz_centers[fine_bin]:
+                    total += np.uint64(intensity[peak_index])
+        partial_tic[scan_number] += total
+
+
+def sum_below_line(
+    dataset_path: Path | str, line_json_path: Path | str, output_path: Path | str, *, threads: int = 3, frame_stride: int = 1
+) -> Path:
+    """Revisit MS1 events and save raw TIC below the JSON-defined fitted line."""
+    dataset_path, line_json_path, output_path = Path(dataset_path), Path(line_json_path), Path(output_path)
+    model = json.loads(line_json_path.read_text())
+    line = model["line"]
+    intercept, slope = float(line["intercept"]), float(line["slope"])
+    mz_min, mz_max = float(model["analysis_mz_range"]["min"]), float(model["analysis_mz_range"]["max"])
+    if threads < 1 or frame_stride < 1:
+        raise ValueError("threads and frame_stride must be at least 1.")
+    if not dataset_path.is_dir():
+        raise FileNotFoundError(f"Dataset directory not found: {dataset_path}")
+    set_num_threads(threads)
+    started = perf_counter()
+    if not opentimspy.bruker_bridge_present:
+        opentimspy.setup_opensource()
+    with OpenTIMS(dataset_path) as dataset:
+        ms1_frames = np.asarray(dataset.ms1_frames, dtype=np.uint32)[::frame_stride]
+        if not ms1_frames.size:
+            raise RuntimeError("No MS1 frames were found.")
+        scan_numbers = np.arange(dataset.min_scan, dataset.max_scan + 1, dtype=np.uint32)
+        scan_mobility_values = dataset.scan_to_inv_ion_mobility(scan_numbers, np.full(scan_numbers.size, ms1_frames[0], dtype=np.uint32))
+        scan_mobility = np.zeros(dataset.max_scan + 1, dtype=np.float64)
+        scan_mobility[scan_numbers] = scan_mobility_values
+        fine_edges = mz_min + np.arange(int(round((mz_max - mz_min) / _FINE_MZ_BIN_WIDTH)) + 1) * _FINE_MZ_BIN_WIDTH
+        fine_centers = (fine_edges[:-1] + fine_edges[1:]) / 2.0
+        fine_tof_edges = dataset.mz_to_tof_frame_sorted(fine_edges, np.full(fine_edges.size, ms1_frames[0], dtype=np.uint32))
+        partial_tic = np.zeros(scan_mobility.size, dtype=np.uint64)
+        for frame in dataset.query_iter(ms1_frames, columns=_COLUMNS):
+            _sum_below_line_frame(frame["scan"], frame["tof"], frame["intensity"], scan_mobility, fine_tof_edges, fine_centers, intercept, slope, partial_tic)
+    result = {"source_line_json": str(line_json_path.resolve()), "dataset": str(dataset_path.resolve()), "line": {"intercept": intercept, "slope": slope}, "tic_below_line": int(partial_tic.sum(dtype=np.uint64)), "event_intensity_threshold": 0, "analysis_mz_range": {"min": mz_min, "max": mz_max}, "frame_stride": frame_stride, "visited_ms1_frames": int(ms1_frames.size), "threads": int(get_num_threads()), "runtime_seconds": perf_counter() - started}
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(result, indent=2) + "\n")
+    return output_path
 
 def dominant_charge_map(intensities: np.ndarray) -> np.ndarray:
     """Return the charge with the largest summed intensity per map box."""
@@ -229,7 +358,9 @@ def _require_matplotlib() -> None:
         raise RuntimeError("Plotting requires the optional dependency. Install with: pip install tickyticker[dev]")
 
 
-def _plot_intensity_maps(intensities: np.ndarray, mz_edges: np.ndarray, mobility_edges: np.ndarray, output_path: Path) -> None:
+def _plot_intensity_maps(
+    intensities: np.ndarray, mz_edges: np.ndarray, mobility_edges: np.ndarray, mz_bin_width: float, output_path: Path
+) -> None:
     """Save per-charge precursor-intensity heatmaps."""
     _require_matplotlib()
     figure, axes = plt.subplots(3, 1, figsize=(16, 10), sharex=True, constrained_layout=True)
@@ -239,19 +370,21 @@ def _plot_intensity_maps(intensities: np.ndarray, mz_edges: np.ndarray, mobility
         )
         axis.set(ylabel="1/K0", title=f"Charge {charge}: log(1 + summed precursor intensity)")
         figure.colorbar(image, ax=axis, pad=0.01, label="log(1 + intensity)")
-    axes[-1].set_xlabel("m/z (1 Da bins)")
+    axes[-1].set_xlabel(f"m/z ({mz_bin_width:g} Da bins)")
     figure.savefig(output_path, dpi=180)
     plt.close(figure)
 
 
-def _plot_dominant_charge_map(dominant: np.ndarray, mz_edges: np.ndarray, mobility_edges: np.ndarray, output_path: Path) -> None:
+def _plot_dominant_charge_map(
+    dominant: np.ndarray, mz_edges: np.ndarray, mobility_edges: np.ndarray, mz_bin_width: float, output_path: Path
+) -> None:
     """Save the categorical dominant-charge view as a PNG."""
     _require_matplotlib()
     colour_map = colors.ListedColormap(["#f5f5f5", "#4c78a8", "#f58518", "#54a24b"])
     normalizer = colors.BoundaryNorm([-0.5, 0.5, 1.5, 2.5, 3.5], colour_map.N)
     figure, axis = plt.subplots(figsize=(16, 3.6), constrained_layout=True)
     image = axis.pcolormesh(mz_edges, mobility_edges, dominant, shading="auto", cmap=colour_map, norm=normalizer)
-    axis.set(xlabel="m/z (1 Da bins)", ylabel="1/K0", title="Dominant charge by summed precursor intensity")
+    axis.set(xlabel=f"m/z ({mz_bin_width:g} Da bins)", ylabel="1/K0", title="Dominant charge by summed precursor intensity")
     colour_bar = figure.colorbar(image, ax=axis, ticks=[0, 1, 2, 3], pad=0.01)
     colour_bar.set_ticklabels(["none", "1", "2", "3"])
     colour_bar.set_label("charge")
@@ -282,28 +415,16 @@ def _plot_charge_border(
     all_ms1_intensities: np.ndarray,
     mz_edges: np.ndarray,
     mobility_edges: np.ndarray,
-    split_mz: np.ndarray,
-    valid_points: np.ndarray,
-    fitted_mz: np.ndarray,
-    border_mz_left: float,
-    border_mz_right: float,
+    boundary: np.ndarray,
+    mz_bin_width: float,
     output_path: Path,
 ) -> None:
-    """Plot per-row split points and their fitted linear spline over all MS1 intensity."""
+    """Plot the polar charge boundary over all MS1 intensity."""
     _require_matplotlib()
-    mobility_centers = (mobility_edges[:-1] + mobility_edges[1:]) / 2.0
     figure, axis = plt.subplots(figsize=(16, 4.5), constrained_layout=True)
-    image = axis.pcolormesh(
-        mz_edges, mobility_edges, np.log1p(all_ms1_intensities), shading="auto", cmap="magma"
-    )
-    axis.scatter(
-        split_mz[valid_points], mobility_centers[valid_points], s=10, c="white", edgecolors="black",
-        linewidths=0.25, label="best row split (both charge classes present)"
-    )
-    axis.plot(fitted_mz, mobility_centers, color="#00d4ff", linewidth=2.0, label="linear spline border")
-    axis.axvline(border_mz_left, color="white", linestyle="--", linewidth=1.0, label="border m/z limits")
-    axis.axvline(border_mz_right, color="white", linestyle="--", linewidth=1.0)
-    axis.set(xlabel="m/z (1 Da bins)", ylabel="1/K0", title="Charge-1 versus charge-2/3 linear-spline border")
+    image = axis.pcolormesh(mz_edges, mobility_edges, np.log1p(all_ms1_intensities), shading="auto", cmap="magma")
+    axis.plot(boundary[0], boundary[1], color="#00d4ff", linewidth=2.0, label="global polar radial border")
+    axis.set(xlabel=f"m/z ({mz_bin_width:g} Da bins)", ylabel="1/K0", title="Charge-1 versus charge-2 polar radial border")
     axis.legend(loc="upper right")
     figure.colorbar(image, ax=axis, pad=0.01, label="log(1 + all MS1 intensity)")
     figure.savefig(output_path, dpi=180)
@@ -318,6 +439,7 @@ def analyse(
     mobility_bins: int = 100,
     mz_min: float = 100.0,
     mz_max: float = 1700.0,
+    mz_bin_width: float = 10.0,
     min_intensity: float = 30.0,
     border_mz_left: float = 350.0,
     border_mz_right: float = 1200.0,
@@ -325,10 +447,13 @@ def analyse(
     threads: int = 3,
     scans_per_mobility_bin: int = 0,
 ) -> Path:
-    """Create charge-resolved maps and a linear-spline charge-1 boundary."""
+    """Create charge-resolved maps and a robust polar charge-1 boundary."""
     dataset_path, output_dir = Path(dataset_path), Path(output_dir)
-    if isotope_count < 1 or mobility_bins < 1 or mz_max <= mz_min:
-        raise ValueError("isotope_count, mobility_bins, and m/z limits must be positive and valid.")
+    if isotope_count < 1 or mobility_bins < 1 or mz_max <= mz_min or mz_bin_width <= 0:
+        raise ValueError("isotope_count, mobility_bins, m/z limits, and m/z bin width must be positive and valid.")
+    fine_bins_per_output_mz_bin = int(round(mz_bin_width / _FINE_MZ_BIN_WIDTH))
+    if not np.isclose(fine_bins_per_output_mz_bin * _FINE_MZ_BIN_WIDTH, mz_bin_width):
+        raise ValueError("mz_bin_width must be an integer multiple of 1/12 Da.")
     if min_intensity < 0 or frame_stride < 1 or threads < 1 or scans_per_mobility_bin < 0:
         raise ValueError("min_intensity must be non-negative, frame_stride and threads at least 1, and scan sampling non-negative.")
     if not mz_min <= border_mz_left < border_mz_right <= mz_max:
@@ -339,14 +464,15 @@ def analyse(
     started = perf_counter()
     set_num_threads(min(threads, mobility_bins))
     output_dir.mkdir(parents=True, exist_ok=True)
-    mz_edges = np.arange(np.floor(mz_min), np.ceil(mz_max) + 1.0, 1.0)
-    mz_min, mz_max = float(mz_edges[0]), float(mz_edges[-1])
+    mz_min, mz_max = float(np.floor(mz_min)), float(np.ceil(mz_max))
+    mz_edges = np.arange(mz_min, mz_max + mz_bin_width * 0.5, mz_bin_width)
+    if mz_edges[-1] < mz_max:
+        mz_edges = np.append(mz_edges, mz_max)
     mz_centers = (mz_edges[:-1] + mz_edges[1:]) / 2.0
     border_mz_mask = (mz_centers >= border_mz_left) & (mz_centers <= border_mz_right)
     border_mz_start_index = int(np.flatnonzero(border_mz_mask)[0])
     border_mz_stop_index = int(np.flatnonzero(border_mz_mask)[-1]) + 1
-    fine_bins_per_dalton = int(round(1.0 / _FINE_MZ_BIN_WIDTH))
-    fine_mz_bin_count = (mz_edges.size - 1) * fine_bins_per_dalton
+    fine_mz_bin_count = int(round((mz_max - mz_min) / _FINE_MZ_BIN_WIDTH))
     if not opentimspy.bruker_bridge_present:
         opentimspy.setup_opensource()
     with OpenTIMS(dataset_path) as dataset:
@@ -394,21 +520,31 @@ def analyse(
                 frame["scan"], frame["tof"], frame["intensity"], intensities, all_ms1_intensities, event_histograms,
                 sampled_scans,
                 scan_mobility_bin_lookup, scan_selected, fine_mz_tof_edges, workspaces,
-                touched_bins, isotope_count, min_intensity,
+                touched_bins, isotope_count, min_intensity, fine_bins_per_output_mz_bin,
             )
             if frame_number % 100 == 0:
                 print(f"Processed {frame_number} MS1 frames", flush=True)
 
     raw_event_intensity_histogram = event_histograms.sum(axis=0, dtype=np.uint64)
-    border_fit_weights = all_ms1_intensities[:, border_mz_mask].sum(axis=1)
-    split_indices, split_mz, split_scores, border_valid_points, spline_knots, spline_coefficients, fitted_mz, one_left = fit_linear_spline_charge_border(
-        intensities, mz_edges, mobility_edges, border_fit_weights, border_mz_start_index, border_mz_stop_index
+    polar_origin, line_one, line_two, polar_boundary_radius, polar_boundary, one_inner, one_mask = fit_polar_charge_border(
+        intensities, all_ms1_intensities, mz_edges, mobility_edges, border_mz_left, border_mz_right
     )
-    one_mask = mz_centers[None, :] < fitted_mz[:, None]
-    if not one_left:
-        one_mask = ~one_mask
-    one_mask &= border_mz_mask[None, :]
     non_one_ms1_intensity = all_ms1_intensities[(~one_mask) & border_mz_mask[None, :]].sum()
+    line_intercept, line_slope, line_alpha, line_origin, line_axes = fit_alpha_separator_line(
+        intensities, all_ms1_intensities, mz_edges, mobility_edges, border_mz_left, border_mz_right
+    )
+    line_json_path = output_dir / "charge_border_line.json"
+    line_json_path.write_text(json.dumps({
+        "model": "robust_1_2_axes_alpha_separator",
+        "line": {"intercept": line_intercept, "slope": line_slope},
+        "separator_alpha_radians": line_alpha,
+        "origin": {"mz": float(line_origin[0]), "inv_ion_mobility": float(line_origin[1])},
+        "robust_axis_coefficients": {"charge_1": {"intercept": float(line_axes[0, 0]), "slope": float(line_axes[0, 1])}, "charge_2": {"intercept": float(line_axes[1, 0]), "slope": float(line_axes[1, 1])}},
+        "analysis_mz_range": {"min": mz_min, "max": mz_max},
+        "fit_mz_range": {"min": border_mz_left, "max": border_mz_right},
+        "min_intensity": min_intensity,
+        "visited_ms1_frames": int(ms1_frames.size),
+    }, indent=2) + "\n")
     runtime_seconds = perf_counter() - started
     npz_path = output_dir / "charge_region_maps.npz"
     np.savez_compressed(
@@ -422,20 +558,23 @@ def analyse(
         border_mz_left=np.array(border_mz_left),
         border_mz_right=np.array(border_mz_right),
         border_considered_mz_bins=border_mz_mask,
-        border_split_indices=split_indices,
-        border_split_mz=split_mz,
-        border_split_scores=split_scores,
-        border_valid_points=border_valid_points,
-        border_fit_weights=border_fit_weights,
-        border_spline_knots=spline_knots,
-        border_spline_coefficients=spline_coefficients,
-        border_fitted_mz=fitted_mz,
-        border_one_charge_on_low_mz_side=np.array(one_left),
+        border_evidence_source=np.array("dominant_charge_map_1_vs_2"),
+        border_model=np.array("robust_axes_global_radial"),
+        border_polar_origin=polar_origin,
+        border_line_one_coefficients=line_one,
+        border_line_two_coefficients=line_two,
+        alpha_separator_line_intercept=np.array(line_intercept),
+        alpha_separator_line_slope=np.array(line_slope),
+        alpha_separator_line_alpha=np.array(line_alpha),
+        border_polar_radius=np.array(polar_boundary_radius),
+        border_polar_boundary=polar_boundary,
+        border_one_charge_is_inner=np.array(one_inner),
         charges=CHARGES,
         mz_edges=mz_edges,
         mobility_edges=mobility_edges,
         sampled_scans_per_mobility_bin=sampled_scans,
         fine_mz_bin_width=np.array(_FINE_MZ_BIN_WIDTH),
+        mz_bin_width=np.array(mz_bin_width),
         isotope_count=np.array(isotope_count),
         min_intensity=np.array(min_intensity),
         charge_assignment=np.array("exclusive_highest_charge_first"),
@@ -446,17 +585,28 @@ def analyse(
         visited_ms1_frames=np.array(ms1_frames.size),
         runtime_seconds=np.array(runtime_seconds),
     )
-    _plot_intensity_maps(intensities, mz_edges, mobility_edges, output_dir / "charge_region_intensities.png")
+    _plot_intensity_maps(intensities, mz_edges, mobility_edges, mz_bin_width, output_dir / "charge_region_intensities.png")
     dominant = dominant_charge_map(intensities)
-    _plot_dominant_charge_map(dominant, mz_edges, mobility_edges, output_dir / "dominant_charge_map.png")
+    _plot_dominant_charge_map(dominant, mz_edges, mobility_edges, mz_bin_width, output_dir / "dominant_charge_map.png")
     _plot_event_intensity_distribution(
         raw_event_intensity_histogram, min_intensity, output_dir / "raw_event_intensity_distribution.png"
     )
     _plot_charge_border(
-        all_ms1_intensities, mz_edges, mobility_edges, split_mz, border_valid_points, fitted_mz,
-        border_mz_left, border_mz_right, output_dir / "charge_border.png"
+        all_ms1_intensities, mz_edges, mobility_edges, polar_boundary, mz_bin_width, output_dir / "charge_border.png"
     )
     return npz_path
+
+def tic_main() -> None:
+    parser = argparse.ArgumentParser(description="Sum raw MS1 TIC below a fitted charge-border line.")
+    parser.add_argument("dataset", type=Path, help="Path to a .d dataset directory.")
+    parser.add_argument("--line-json", type=Path, required=True, help="charge_border_line.json from charge-regions.")
+    parser.add_argument("--output", type=Path, required=True, help="Output JSON file.")
+    parser.add_argument("--threads", type=int, default=3)
+    parser.add_argument("--frame-stride", type=int, default=1)
+    args = parser.parse_args()
+    output = sum_below_line(args.dataset, args.line_json, args.output, threads=args.threads, frame_stride=args.frame_stride)
+    print(f"Saved below-line TIC to {output}")
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -466,6 +616,7 @@ def main() -> None:
     parser.add_argument("--mobility-bins", type=int, default=100)
     parser.add_argument("--mz-min", type=float, default=100.0)
     parser.add_argument("--mz-max", type=float, default=1700.0)
+    parser.add_argument("--mz-bin-width", type=float, default=10.0, help="Final map m/z bin width in Da (default: 10).")
     parser.add_argument("--min-intensity", type=float, default=30.0, help="Ignore raw events below this intensity.")
     parser.add_argument("--border-mz-left", type=float, default=350.0, help="Left m/z limit for border fitting and aggregation.")
     parser.add_argument("--border-mz-right", type=float, default=1200.0, help="Right m/z limit for border fitting and aggregation.")
@@ -475,7 +626,7 @@ def main() -> None:
     args = parser.parse_args()
     output = analyse(
         args.dataset, args.output_dir, isotope_count=args.isotope_count,
-        mobility_bins=args.mobility_bins, mz_min=args.mz_min, mz_max=args.mz_max,
+        mobility_bins=args.mobility_bins, mz_min=args.mz_min, mz_max=args.mz_max, mz_bin_width=args.mz_bin_width,
         min_intensity=args.min_intensity, border_mz_left=args.border_mz_left, border_mz_right=args.border_mz_right,
         frame_stride=args.frame_stride, threads=args.threads,
         scans_per_mobility_bin=args.scans_per_mobility_bin,

@@ -4,6 +4,7 @@
 timsTOF MS1 data. It reads `.d` directories frame-by-frame with OpenTIMS,
 bins each scan at 1/12 Da using a first-MS1-frame TOF-to-m/z lookup, and
 aggregates exclusive charge assignments into one 3D precursor-intensity map.
+The final map width is configurable with `--mz-bin-width` and defaults to 10 Da.
 
 ## Install
 
@@ -19,6 +20,7 @@ python -m pip install -e '.[dev]'
 
 ```bash
 charge-regions data/G260811_092_Slot2-1_1_24990.d --output-dir charge_regions_092
+below-line-tic data/G260811_092_Slot2-1_1_24990.d --line-json charge_regions_092/charge_border_line.json --output charge_regions_092/below_line_tic.json
 ```
 
 Raw events below `--min-intensity` are excluded before m/z binning (default:
@@ -35,7 +37,7 @@ Each run writes:
 - `charge_region_maps.npz`: one `(charge, 1/K0 bin, m/z bin)` intensity tensor, with m/z and 1/K0 bin edges;
 - `charge_region_intensities.png`: a three-panel charge-resolved intensity heatmap;
 - `dominant_charge_map.png`: the charge with the highest summed intensity per box, as a categorical plot;
-- `charge_border.png`: valid per-mobility, class-balanced m/z split points and their total-intensity-weighted linear-spline border over all MS1 intensity;
+- `charge_border.png`: a robust polar charge border: dominant 1+/2+ axes, their intersection, and one class-balanced global radial split over all MS1 intensity;
 - `raw_event_intensity_distribution.png`: log-scale distribution of all visited raw events, with the selected minimum-intensity threshold;
 - `all_ms1_intensities`, `raw_event_intensity_histogram` (128 `uint64` bins; last is ≥128), `one_charge_mask`, border data, and `non_one_ms1_intensity` in the `.npz` result;
 - `sampled_scans_per_mobility_bin`: exposure for normalizing intensity maps produced with scan subsampling.

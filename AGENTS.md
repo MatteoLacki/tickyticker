@@ -18,13 +18,14 @@ defined only in `pyproject.toml`.
 ```bash
 .venv/bin/python -m pip install -e '.[dev]'
 .venv/bin/charge-regions DATASET.d --output-dir OUTPUT_DIRECTORY
+.venv/bin/below-line-tic DATASET.d --line-json OUTPUT_DIRECTORY/charge_border_line.json --output OUTPUT_DIRECTORY/below_line_tic.json
 ```
 
 `charge-regions` iterates MS1 frames with OpenTIMS, applies a first-MS1-frame
 TOF-to-m/z lookup to bin every scan at 1/12 Da, then tests strictly decreasing,
 nonzero isotope envelopes for charges 3, 2, and 1 at 4-, 6-, and 12-bin
 spacings. Each accepted precursor is assigned exclusively to the first matching
-charge and added to its 1 Da m/z × 100 equal-width 1/K0-bin intensity map.
+charge and added to its configurable final m/z-bin-width intensity map (default: 10 Da) × 100 equal-width 1/K0 bins.
 Preserve configurable isotope count, minimum raw-event intensity (default 30), charge-border m/z limits (defaults 350–1200), and MS1 frame stride (default 1); sub-threshold events do not enter binned maps or charge evidence, but are counted in the raw-event histogram.
 
 ## Implementation conventions
@@ -36,7 +37,7 @@ Preserve configurable isotope count, minimum raw-event intensity (default 30), c
 - Use calibrated `mz` and `inv_ion_mobility` coordinates in outputs.
 - Preserve independent intensity maps for all charge states unless explicitly asked to
   collapse them.
-- Save numerical results as `.npz`, plus PNG intensity, dominant-charge, and fitted linear-spline charge-border views.
+- Save numerical results as `.npz`, plus PNG intensity, dominant-charge, and fitted robust polar charge-border views.
 - Record runtime and exact parameters for every full dataset run.
 
 ## Validation
