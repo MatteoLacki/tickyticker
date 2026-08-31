@@ -20,11 +20,12 @@ defined only in `pyproject.toml`.
 .venv/bin/charge-regions DATASET.d --output-dir OUTPUT_DIRECTORY
 ```
 
-`charge-regions` iterates MS1 frames with OpenTIMS, finds local m/z maxima in
-each scan, tests isotope continuations for charges 1–3 at spacings 1, 1/2, and
-1/3 Da, and writes separate charge-resolved intensity maps using 1 Da m/z bins and 100 equal-width
-1/K0 bins. Defaults are 10 ppm and three following isotope positions; preserve
-their configurability.
+`charge-regions` iterates MS1 frames with OpenTIMS, applies a first-MS1-frame
+TOF-to-m/z lookup to bin every scan at 1/12 Da, then tests strictly decreasing,
+nonzero isotope envelopes for charges 3, 2, and 1 at 4-, 6-, and 12-bin
+spacings. Each accepted precursor is assigned exclusively to the first matching
+charge and added to its 1 Da m/z × 100 equal-width 1/K0-bin intensity map.
+Preserve configurable isotope count, minimum raw-event intensity (default 30), charge-border m/z limits (defaults 350–1200), and MS1 frame stride (default 1); sub-threshold events do not enter binned maps or charge evidence, but are counted in the raw-event histogram.
 
 ## Implementation conventions
 
@@ -35,7 +36,7 @@ their configurability.
 - Use calibrated `mz` and `inv_ion_mobility` coordinates in outputs.
 - Preserve independent intensity maps for all charge states unless explicitly asked to
   collapse them.
-- Save numerical results as `.npz`, plus both PNG and ASCII dominant-charge views.
+- Save numerical results as `.npz`, plus PNG intensity, dominant-charge, and fitted linear-spline charge-border views.
 - Record runtime and exact parameters for every full dataset run.
 
 ## Validation
