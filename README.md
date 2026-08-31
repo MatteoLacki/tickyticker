@@ -1,56 +1,85 @@
 # tickyticker
 
-`tickyticker` maps isotope-spacing evidence for charge states 1–3 in Bruker
-timsTOF MS1 data. It reads `.d` directories frame-by-frame with OpenTIMS,
-bins each scan at 1/12 Da using a first-MS1-frame TOF-to-m/z lookup, and
-aggregates exclusive charge assignments into one 3D precursor-intensity map.
-The final map width is configurable with `--mz-bin-width` and defaults to 10 Da.
+`tickyticker` identifies charge-resolved isotope evidence in Bruker timsTOF
+MS1 data and maps it in m/z × inverse-ion-mobility (1/K0) space.
 
-## Install
+It processes `.d` directories one MS1 frame at a time with OpenTIMS, NumPy,
+and Numba. Raw data are never modified.
+
+## Installation
 
 ```bash
-# Core analysis only
 python -m pip install -e .
-
-# Core analysis plus PNG plot generation
-python -m pip install -e '.[dev]'
+# Add PNG plot support:
+python -m pip install -e ".[dev]"
 ```
 
-## Run
+## Charge-region analysis
 
 ```bash
-charge-regions data/G260811_092_Slot2-1_1_24990.d --output-dir charge_regions_092
-below-line-tic data/G260811_092_Slot2-1_1_24990.d --line-json charge_regions_092/charge_border_line.json --output charge_regions_092/below_line_tic.json
+charge-regions data/G260811_092_Slot2-1_1_24990.d \
+  --output-dir results/hela_092
 ```
 
-Raw events below `--min-intensity` are excluded before m/z binning (default:
-30). Each candidate requires three following, nonzero isotope bins with strictly
-decreasing intensities. The charge-border fit and non-1+ aggregate use only
-`--border-mz-left` through `--border-mz-right` (defaults: 350–1200 m/z).
-Use `--frame-stride K` (default: 1) to visit every K-th MS1 frame. Charge 3 (4-bin spacing) is tested first, followed by
-charge 2 (6 bins) and charge 1 (12 bins), so an accepted precursor contributes
-its raw intensity to exactly one charge map. Use `charge-regions --help` to
-view all parameters.
+The command bins each scan onto a 1/12 Da intermediate grid, detects strictly
+decreasing isotope continuations for charges 1, 2, and 3, then adds precursor
+intensity to an exclusive 3D tensor:
 
-Each run writes:
+```text
+(charge, 1/K0 bin, m/z bin)
+```
 
-- `charge_region_maps.npz`: one `(charge, 1/K0 bin, m/z bin)` intensity tensor, with m/z and 1/K0 bin edges;
-- `charge_region_intensities.png`: a three-panel charge-resolved intensity heatmap;
-- `dominant_charge_map.png`: the charge with the highest summed intensity per box, as a categorical plot;
-- `charge_border.png`: a robust polar charge border: dominant 1+/2+ axes, their intersection, and one class-balanced global radial split over all MS1 intensity;
-- `raw_event_intensity_distribution.png`: log-scale distribution of all visited raw events, with the selected minimum-intensity threshold;
-- `all_ms1_intensities`, `raw_event_intensity_histogram` (128 `uint64` bins; last is ≥128), `one_charge_mask`, border data, and `non_one_ms1_intensity` in the `.npz` result;
-- `sampled_scans_per_mobility_bin`: exposure for normalizing intensity maps produced with scan subsampling.
+Charge 3 is tested first, followed by charge 2 and charge 1. The final m/z
+bin width defaults to 10 Da (`--mz-bin-width`); the default map has 100 equal
+1/K0 bins. Events below `--min-intensity` (default: 30) do not enter the map
+or charge evidence.
 
-Raw files under `data/` are input-only and are never modified.
+The command also fits a separator line from robust dominant 1+ and 2+ axes in
+the configurable border m/z interval (default: 350–1200). Its intercept and
+slope are stored in `charge_border_line.json`.
 
-## Parallelism and scan subsampling
+Main options:
 
-Use `--threads` to set Numba CPU parallelism (default: 3). Each MS1 frame is
-split into independent 1/K0-bin tasks. A task owns its output mobility slice,
-so it bins and adds scan intensities directly without locks or float atomics.
-Scan-to-1/K0-bin assignments are evaluated once with OpenTIMS for the first
-MS1 frame and reused thereafter. Use `--scans-per-mobility-bin N` to select
-`N` evenly spaced scans in each populated 1/K0 bin of every MS1 frame. `0`
-(the default) processes all scans. When subsampling, divide each mobility row
-by `sampled_scans_per_mobility_bin` before comparing intensities between runs.
+```bash
+charge-regions --help
+```
+
+Useful controls include `--threads` (default: 3), `--frame-stride`,
+`--scans-per-mobility-bin`, `--min-intensity`, `--border-mz-left`, and
+`--border-mz-right`.
+
+## Below-line TIC pass
+
+Use the line JSON from a completed charge-region run to revisit the raw MS1
+events and sum all event intensity below the fitted line:
+
+```bash
+below-line-tic data/G260811_092_Slot2-1_1_24990.d \
+  --line-json results/hela_092/charge_border_line.json \
+  --output results/hela_092/below_line_tic.json \
+  --threads 3
+```
+
+This second pass is Numba-parallel over scans and uses the first-frame
+calibrated TOF-to-m/z lookup. `below_line_tic.json` records the total TIC,
+line intercept and slope, m/z range, frame stride, thread count, visited MS1
+frames, and runtime.
+
+## Outputs
+
+`charge-regions` writes these files into the output directory:
+
+- `charge_region_maps.npz` — charge-resolved intensity tensor and coordinate edges.
+- `charge_region_intensities.png` — one heatmap per charge.
+- `dominant_charge_map.png` — charge with the greatest intensity in each map box.
+- `charge_border.png` — fitted charge-border view over total MS1 intensity.
+- `charge_border_line.json` — fitted line parameters for `below-line-tic`.
+- `raw_event_intensity_distribution.png` — log-scale raw-event intensity histogram.
+
+The `.npz` contains `intensities`, `all_ms1_intensities`, `charges`,
+`mz_edges`, `mobility_edges`, and `sampled_scans_per_mobility_bin`, together
+with fitting metadata and exact run parameters.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
