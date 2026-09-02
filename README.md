@@ -48,6 +48,25 @@ Useful controls include `--threads` (default: 3), `--frame-stride`,
 `--scans-per-mobility-bin`, `--min-intensity`, `--border-mz-left`, and
 `--border-mz-right`.
 
+### Python API
+
+Call `analyse()` without an output directory to receive the complete numerical
+result in memory without writing NPZ, JSON, or PNG files:
+
+```python
+from tickyticker.charge_regions import analyse
+
+result = analyse("data/sample.d", progress=print)
+print(result.intensities.shape)
+print(result.line_data["line"])
+```
+
+The returned `ChargeRegionResult` also contains the raw-event histogram,
+coordinate edges, sampled-scan counts, fitted-border arrays, runtime, and
+effective thread count. Passing `output_dir` retains the archival CLI behavior
+and writes the complete standard artifact set in addition to returning the
+result.
+
 ## Below-line TIC pass
 
 Use the line JSON from a completed charge-region run to revisit the raw MS1

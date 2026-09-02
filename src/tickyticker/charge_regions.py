@@ -6,8 +6,10 @@ from time import perf_counter
 
 import argparse
 import json
+from dataclasses import dataclass
 from itertools import chain
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import opentimspy
@@ -29,6 +31,32 @@ CHARGES = np.array([1, 2, 3], dtype=np.int64)
 _COLUMNS = ("scan", "tof", "intensity")
 _FINE_MZ_BIN_WIDTH = 1.0 / 12.0
 _ISOTOPE_BIN_STEPS = np.array([12, 6, 4], dtype=np.int64)
+
+
+@dataclass(frozen=True, slots=True)
+class ChargeRegionResult:
+    """In-memory numerical result of one charge-region analysis."""
+
+    intensities: np.ndarray
+    all_ms1_intensities: np.ndarray
+    raw_event_intensity_histogram: np.ndarray
+    one_charge_mask: np.ndarray
+    non_one_ms1_intensity: float
+    border_mz_mask: np.ndarray
+    polar_origin: np.ndarray
+    line_one: np.ndarray
+    line_two: np.ndarray
+    polar_boundary_radius: float
+    polar_boundary: np.ndarray
+    one_charge_is_inner: bool
+    charges: np.ndarray
+    mz_edges: np.ndarray
+    mobility_edges: np.ndarray
+    sampled_scans_per_mobility_bin: np.ndarray
+    line_data: dict[str, object]
+    visited_ms1_frames: int
+    runtime_seconds: float
+    effective_threads: int
 
 
 @njit(cache=True, parallel=True)
@@ -433,7 +461,7 @@ def _plot_charge_border(
 
 def analyse(
     dataset_path: Path | str,
-    output_dir: Path | str,
+    output_dir: Path | str | None = None,
     *,
     isotope_count: int = 3,
     mobility_bins: int = 100,
@@ -446,9 +474,15 @@ def analyse(
     frame_stride: int = 1,
     threads: int = 3,
     scans_per_mobility_bin: int = 0,
-) -> Path:
-    """Create charge-resolved maps and a robust polar charge-1 boundary."""
-    dataset_path, output_dir = Path(dataset_path), Path(output_dir)
+    progress: Callable[[str], None] | None = None,
+) -> ChargeRegionResult:
+    """Analyse a dataset and optionally persist the complete CLI artifacts.
+
+    When ``output_dir`` is omitted, this is a pure in-memory API: no NPZ, JSON,
+    or plot files are written. Callers receive every numerical result directly.
+    """
+    dataset_path = Path(dataset_path)
+    resolved_output_dir = Path(output_dir) if output_dir is not None else None
     if isotope_count < 1 or mobility_bins < 1 or mz_max <= mz_min or mz_bin_width <= 0:
         raise ValueError("isotope_count, mobility_bins, m/z limits, and m/z bin width must be positive and valid.")
     fine_bins_per_output_mz_bin = int(round(mz_bin_width / _FINE_MZ_BIN_WIDTH))
@@ -463,7 +497,8 @@ def analyse(
 
     started = perf_counter()
     set_num_threads(min(threads, mobility_bins))
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if resolved_output_dir is not None:
+        resolved_output_dir.mkdir(parents=True, exist_ok=True)
     mz_min, mz_max = float(np.floor(mz_min)), float(np.ceil(mz_max))
     mz_edges = np.arange(mz_min, mz_max + mz_bin_width * 0.5, mz_bin_width)
     if mz_edges[-1] < mz_max:
@@ -522,10 +557,12 @@ def analyse(
                 scan_mobility_bin_lookup, scan_selected, fine_mz_tof_edges, workspaces,
                 touched_bins, isotope_count, min_intensity, fine_bins_per_output_mz_bin,
             )
-            if frame_number % 100 == 0:
-                print(f"Processed {frame_number} MS1 frames", flush=True)
+            if progress is not None and frame_number % 100 == 0:
+                progress(f"Processed {frame_number} MS1 frames")
 
     raw_event_intensity_histogram = event_histograms.sum(axis=0, dtype=np.uint64)
+    if progress is not None:
+        progress("Fitting charge border")
     polar_origin, line_one, line_two, polar_boundary_radius, polar_boundary, one_inner, one_mask = fit_polar_charge_border(
         intensities, all_ms1_intensities, mz_edges, mobility_edges, border_mz_left, border_mz_right
     )
@@ -533,8 +570,7 @@ def analyse(
     line_intercept, line_slope, line_alpha, line_origin, line_axes = fit_alpha_separator_line(
         intensities, all_ms1_intensities, mz_edges, mobility_edges, border_mz_left, border_mz_right
     )
-    line_json_path = output_dir / "charge_border_line.json"
-    line_json_path.write_text(json.dumps({
+    line_data: dict[str, object] = {
         "model": "robust_1_2_axes_alpha_separator",
         "line": {"intercept": line_intercept, "slope": line_slope},
         "separator_alpha_radians": line_alpha,
@@ -544,9 +580,38 @@ def analyse(
         "fit_mz_range": {"min": border_mz_left, "max": border_mz_right},
         "min_intensity": min_intensity,
         "visited_ms1_frames": int(ms1_frames.size),
-    }, indent=2) + "\n")
+    }
     runtime_seconds = perf_counter() - started
-    npz_path = output_dir / "charge_region_maps.npz"
+    result = ChargeRegionResult(
+        intensities=intensities,
+        all_ms1_intensities=all_ms1_intensities,
+        raw_event_intensity_histogram=raw_event_intensity_histogram,
+        one_charge_mask=one_mask,
+        non_one_ms1_intensity=float(non_one_ms1_intensity),
+        border_mz_mask=border_mz_mask,
+        polar_origin=polar_origin,
+        line_one=line_one,
+        line_two=line_two,
+        polar_boundary_radius=float(polar_boundary_radius),
+        polar_boundary=polar_boundary,
+        one_charge_is_inner=bool(one_inner),
+        charges=CHARGES.copy(),
+        mz_edges=mz_edges,
+        mobility_edges=mobility_edges,
+        sampled_scans_per_mobility_bin=sampled_scans,
+        line_data=line_data,
+        visited_ms1_frames=int(ms1_frames.size),
+        runtime_seconds=runtime_seconds,
+        effective_threads=int(get_num_threads()),
+    )
+    if resolved_output_dir is None:
+        if progress is not None:
+            progress("Analysis complete")
+        return result
+
+    line_json_path = resolved_output_dir / "charge_border_line.json"
+    line_json_path.write_text(json.dumps(line_data, indent=2) + "\n")
+    npz_path = resolved_output_dir / "charge_region_maps.npz"
     np.savez_compressed(
         npz_path,
         intensities=intensities,
@@ -585,16 +650,37 @@ def analyse(
         visited_ms1_frames=np.array(ms1_frames.size),
         runtime_seconds=np.array(runtime_seconds),
     )
-    _plot_intensity_maps(intensities, mz_edges, mobility_edges, mz_bin_width, output_dir / "charge_region_intensities.png")
+    _plot_intensity_maps(
+        intensities,
+        mz_edges,
+        mobility_edges,
+        mz_bin_width,
+        resolved_output_dir / "charge_region_intensities.png",
+    )
     dominant = dominant_charge_map(intensities)
-    _plot_dominant_charge_map(dominant, mz_edges, mobility_edges, mz_bin_width, output_dir / "dominant_charge_map.png")
+    _plot_dominant_charge_map(
+        dominant,
+        mz_edges,
+        mobility_edges,
+        mz_bin_width,
+        resolved_output_dir / "dominant_charge_map.png",
+    )
     _plot_event_intensity_distribution(
-        raw_event_intensity_histogram, min_intensity, output_dir / "raw_event_intensity_distribution.png"
+        raw_event_intensity_histogram,
+        min_intensity,
+        resolved_output_dir / "raw_event_intensity_distribution.png",
     )
     _plot_charge_border(
-        all_ms1_intensities, mz_edges, mobility_edges, polar_boundary, mz_bin_width, output_dir / "charge_border.png"
+        all_ms1_intensities,
+        mz_edges,
+        mobility_edges,
+        polar_boundary,
+        mz_bin_width,
+        resolved_output_dir / "charge_border.png",
     )
-    return npz_path
+    if progress is not None:
+        progress("Analysis complete")
+    return result
 
 def tic_main() -> None:
     parser = argparse.ArgumentParser(description="Sum raw MS1 TIC below a fitted charge-border line.")
@@ -624,15 +710,16 @@ def main() -> None:
     parser.add_argument("--threads", type=int, default=3)
     parser.add_argument("--scans-per-mobility-bin", type=int, default=0)
     args = parser.parse_args()
-    output = analyse(
+    analyse(
         args.dataset, args.output_dir, isotope_count=args.isotope_count,
         mobility_bins=args.mobility_bins, mz_min=args.mz_min, mz_max=args.mz_max, mz_bin_width=args.mz_bin_width,
         min_intensity=args.min_intensity, border_mz_left=args.border_mz_left, border_mz_right=args.border_mz_right,
         frame_stride=args.frame_stride, threads=args.threads,
         scans_per_mobility_bin=args.scans_per_mobility_bin,
+        progress=print,
     )
-    print(f"Saved intensity maps to {output}")
-    print(f"Saved plots to {output.parent}")
+    print(f"Saved intensity maps to {args.output_dir / 'charge_region_maps.npz'}")
+    print(f"Saved plots to {args.output_dir}")
 
 
 if __name__ == "__main__":
