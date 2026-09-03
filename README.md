@@ -67,22 +67,24 @@ effective thread count. Passing `output_dir` retains the archival CLI behavior
 and writes the complete standard artifact set in addition to returning the
 result.
 
-## Below-line TIC pass
+## Split-line TIC pass
 
 Use the line JSON from a completed charge-region run to revisit the raw MS1
-events and sum all event intensity below the fitted line:
+events and sum event intensity below and on/above the fitted line:
 
 ```bash
 below-line-tic data/G260811_092_Slot2-1_1_24990.d \
   --line-json results/hela_092/charge_border_line.json \
   --output results/hela_092/below_line_tic.json \
+  --min-intensity 30 \
   --threads 3
 ```
 
 This second pass is Numba-parallel over scans and uses the first-frame
-calibrated TOF-to-m/z lookup. `below_line_tic.json` records the total TIC,
-line intercept and slope, m/z range, frame stride, thread count, visited MS1
-frames, and runtime.
+calibrated TOF-to-m/z lookup. `below_line_tic.json` records both TIC totals,
+the intensity threshold, line intercept and slope, m/z range, frame stride,
+thread count, visited MS1 frames, and runtime. Python callers can avoid the
+JSON round trip and call `analyse_line_tic()` directly for a `LineTicResult`.
 
 ## Outputs
 

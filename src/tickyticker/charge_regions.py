@@ -59,6 +59,23 @@ class ChargeRegionResult:
     effective_threads: int
 
 
+@dataclass(frozen=True, slots=True)
+class LineTicResult:
+    """In-memory thresholded TIC totals on both sides of a fitted line."""
+
+    tic_below_line: int
+    tic_above_line: int
+    line_intercept: float
+    line_slope: float
+    mz_min: float
+    mz_max: float
+    min_intensity: float
+    frame_stride: int
+    visited_ms1_frames: int
+    runtime_seconds: float
+    effective_threads: int
+
+
 @njit(cache=True, parallel=True)
 def _process_ms1_frame(
     scan: np.ndarray,
@@ -298,7 +315,7 @@ def fit_alpha_separator_line(
 
 
 @njit(cache=True, parallel=True)
-def _sum_below_line_frame(
+def _sum_line_sides_frame(
     scan: np.ndarray,
     tof: np.ndarray,
     intensity: np.ndarray,
@@ -307,9 +324,11 @@ def _sum_below_line_frame(
     fine_mz_centers: np.ndarray,
     intercept: float,
     slope: float,
-    partial_tic: np.ndarray,
+    min_intensity: float,
+    partial_below_tic: np.ndarray,
+    partial_above_tic: np.ndarray,
 ) -> None:
-    """Sum raw event intensity below a line, in parallel over scans."""
+    """Sum filtered raw intensity on both line sides, parallel over scans."""
     if scan.size == 0:
         return
     starts = np.full(scan_mobility.size, -1, dtype=np.int64)
@@ -327,49 +346,168 @@ def _sum_below_line_frame(
         start = starts[scan_number]
         if start < 0:
             continue
-        total = np.uint64(0)
+        below_total = np.uint64(0)
+        above_total = np.uint64(0)
         for peak_index in range(start, stops[scan_number]):
-            fine_bin = np.searchsorted(fine_mz_tof_edges, tof[peak_index], side="right") - 1
+            if intensity[peak_index] < min_intensity:
+                continue
+            fine_bin = (
+                np.searchsorted(
+                    fine_mz_tof_edges, tof[peak_index], side="right"
+                )
+                - 1
+            )
             if 0 <= fine_bin < fine_mz_centers.size:
-                if scan_mobility[scan_number] < intercept + slope * fine_mz_centers[fine_bin]:
-                    total += np.uint64(intensity[peak_index])
-        partial_tic[scan_number] += total
+                if (
+                    scan_mobility[scan_number]
+                    < intercept + slope * fine_mz_centers[fine_bin]
+                ):
+                    below_total += np.uint64(intensity[peak_index])
+                else:
+                    above_total += np.uint64(intensity[peak_index])
+        partial_below_tic[scan_number] += below_total
+        partial_above_tic[scan_number] += above_total
 
 
-def sum_below_line(
-    dataset_path: Path | str, line_json_path: Path | str, output_path: Path | str, *, threads: int = 3, frame_stride: int = 1
-) -> Path:
-    """Revisit MS1 events and save raw TIC below the JSON-defined fitted line."""
-    dataset_path, line_json_path, output_path = Path(dataset_path), Path(line_json_path), Path(output_path)
-    model = json.loads(line_json_path.read_text())
-    line = model["line"]
-    intercept, slope = float(line["intercept"]), float(line["slope"])
-    mz_min, mz_max = float(model["analysis_mz_range"]["min"]), float(model["analysis_mz_range"]["max"])
+def analyse_line_tic(
+    dataset_path: Path | str,
+    *,
+    intercept: float,
+    slope: float,
+    mz_min: float,
+    mz_max: float,
+    min_intensity: float = 30.0,
+    threads: int = 3,
+    frame_stride: int = 1,
+    progress: Callable[[str], None] | None = None,
+) -> LineTicResult:
+    """Return thresholded MS1 TIC below and on/above a fitted line."""
+    dataset_path = Path(dataset_path)
     if threads < 1 or frame_stride < 1:
         raise ValueError("threads and frame_stride must be at least 1.")
+    if not np.isfinite(mz_min) or not np.isfinite(mz_max) or mz_min >= mz_max:
+        raise ValueError("m/z limits must be finite and ordered.")
+    if min_intensity < 0 or not np.isfinite(min_intensity):
+        raise ValueError("Minimum intensity must be finite and nonnegative.")
+    if not np.isfinite(intercept) or not np.isfinite(slope):
+        raise ValueError("Line intercept and slope must be finite.")
     if not dataset_path.is_dir():
         raise FileNotFoundError(f"Dataset directory not found: {dataset_path}")
+
     set_num_threads(threads)
     started = perf_counter()
     if not opentimspy.bruker_bridge_present:
         opentimspy.setup_opensource()
     with OpenTIMS(dataset_path) as dataset:
-        ms1_frames = np.asarray(dataset.ms1_frames, dtype=np.uint32)[::frame_stride]
+        ms1_frames = np.asarray(dataset.ms1_frames, dtype=np.uint32)[
+            ::frame_stride
+        ]
         if not ms1_frames.size:
             raise RuntimeError("No MS1 frames were found.")
-        scan_numbers = np.arange(dataset.min_scan, dataset.max_scan + 1, dtype=np.uint32)
-        scan_mobility_values = dataset.scan_to_inv_ion_mobility(scan_numbers, np.full(scan_numbers.size, ms1_frames[0], dtype=np.uint32))
+        scan_numbers = np.arange(
+            dataset.min_scan, dataset.max_scan + 1, dtype=np.uint32
+        )
+        scan_mobility_values = dataset.scan_to_inv_ion_mobility(
+            scan_numbers,
+            np.full(scan_numbers.size, ms1_frames[0], dtype=np.uint32),
+        )
         scan_mobility = np.zeros(dataset.max_scan + 1, dtype=np.float64)
         scan_mobility[scan_numbers] = scan_mobility_values
-        fine_edges = mz_min + np.arange(int(round((mz_max - mz_min) / _FINE_MZ_BIN_WIDTH)) + 1) * _FINE_MZ_BIN_WIDTH
+        fine_bin_count = int(
+            round((mz_max - mz_min) / _FINE_MZ_BIN_WIDTH)
+        )
+        fine_edges = (
+            mz_min
+            + np.arange(fine_bin_count + 1) * _FINE_MZ_BIN_WIDTH
+        )
         fine_centers = (fine_edges[:-1] + fine_edges[1:]) / 2.0
-        fine_tof_edges = dataset.mz_to_tof_frame_sorted(fine_edges, np.full(fine_edges.size, ms1_frames[0], dtype=np.uint32))
-        partial_tic = np.zeros(scan_mobility.size, dtype=np.uint64)
-        for frame in dataset.query_iter(ms1_frames, columns=_COLUMNS):
-            _sum_below_line_frame(frame["scan"], frame["tof"], frame["intensity"], scan_mobility, fine_tof_edges, fine_centers, intercept, slope, partial_tic)
-    result = {"source_line_json": str(line_json_path.resolve()), "dataset": str(dataset_path.resolve()), "line": {"intercept": intercept, "slope": slope}, "tic_below_line": int(partial_tic.sum(dtype=np.uint64)), "event_intensity_threshold": 0, "analysis_mz_range": {"min": mz_min, "max": mz_max}, "frame_stride": frame_stride, "visited_ms1_frames": int(ms1_frames.size), "threads": int(get_num_threads()), "runtime_seconds": perf_counter() - started}
+        fine_tof_edges = dataset.mz_to_tof_frame_sorted(
+            fine_edges,
+            np.full(fine_edges.size, ms1_frames[0], dtype=np.uint32),
+        )
+        partial_below_tic = np.zeros(scan_mobility.size, dtype=np.uint64)
+        partial_above_tic = np.zeros(scan_mobility.size, dtype=np.uint64)
+        for frame_number, frame in enumerate(
+            dataset.query_iter(ms1_frames, columns=_COLUMNS), start=1
+        ):
+            _sum_line_sides_frame(
+                frame["scan"],
+                frame["tof"],
+                frame["intensity"],
+                scan_mobility,
+                fine_tof_edges,
+                fine_centers,
+                intercept,
+                slope,
+                min_intensity,
+                partial_below_tic,
+                partial_above_tic,
+            )
+            if progress is not None and frame_number % 100 == 0:
+                progress(f"Processed {frame_number} MS1 frames")
+
+    result = LineTicResult(
+        tic_below_line=int(partial_below_tic.sum(dtype=np.uint64)),
+        tic_above_line=int(partial_above_tic.sum(dtype=np.uint64)),
+        line_intercept=float(intercept),
+        line_slope=float(slope),
+        mz_min=float(mz_min),
+        mz_max=float(mz_max),
+        min_intensity=float(min_intensity),
+        frame_stride=frame_stride,
+        visited_ms1_frames=int(ms1_frames.size),
+        runtime_seconds=perf_counter() - started,
+        effective_threads=int(get_num_threads()),
+    )
+    if progress is not None:
+        progress("TIC analysis complete")
+    return result
+
+
+def sum_below_line(
+    dataset_path: Path | str,
+    line_json_path: Path | str,
+    output_path: Path | str,
+    *,
+    min_intensity: float = 0.0,
+    threads: int = 3,
+    frame_stride: int = 1,
+) -> Path:
+    """Save TIC on both sides of a JSON-defined line; retain the legacy name."""
+    dataset_path = Path(dataset_path)
+    line_json_path = Path(line_json_path)
+    output_path = Path(output_path)
+    model = json.loads(line_json_path.read_text())
+    line = model["line"]
+    mz_range = model["analysis_mz_range"]
+    result = analyse_line_tic(
+        dataset_path,
+        intercept=float(line["intercept"]),
+        slope=float(line["slope"]),
+        mz_min=float(mz_range["min"]),
+        mz_max=float(mz_range["max"]),
+        min_intensity=min_intensity,
+        threads=threads,
+        frame_stride=frame_stride,
+    )
+    payload = {
+        "source_line_json": str(line_json_path.resolve()),
+        "dataset": str(dataset_path.resolve()),
+        "line": {
+            "intercept": result.line_intercept,
+            "slope": result.line_slope,
+        },
+        "tic_below_line": result.tic_below_line,
+        "tic_above_line": result.tic_above_line,
+        "event_intensity_threshold": result.min_intensity,
+        "analysis_mz_range": {"min": result.mz_min, "max": result.mz_max},
+        "frame_stride": result.frame_stride,
+        "visited_ms1_frames": result.visited_ms1_frames,
+        "threads": result.effective_threads,
+        "runtime_seconds": result.runtime_seconds,
+    }
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(result, indent=2) + "\n")
+    output_path.write_text(json.dumps(payload, indent=2) + "\n")
     return output_path
 
 def dominant_charge_map(intensities: np.ndarray) -> np.ndarray:
@@ -683,15 +821,25 @@ def analyse(
     return result
 
 def tic_main() -> None:
-    parser = argparse.ArgumentParser(description="Sum raw MS1 TIC below a fitted charge-border line.")
+    parser = argparse.ArgumentParser(
+        description="Sum filtered raw MS1 TIC on both sides of a fitted line."
+    )
     parser.add_argument("dataset", type=Path, help="Path to a .d dataset directory.")
     parser.add_argument("--line-json", type=Path, required=True, help="charge_border_line.json from charge-regions.")
     parser.add_argument("--output", type=Path, required=True, help="Output JSON file.")
+    parser.add_argument("--min-intensity", type=float, default=0.0)
     parser.add_argument("--threads", type=int, default=3)
     parser.add_argument("--frame-stride", type=int, default=1)
     args = parser.parse_args()
-    output = sum_below_line(args.dataset, args.line_json, args.output, threads=args.threads, frame_stride=args.frame_stride)
-    print(f"Saved below-line TIC to {output}")
+    output = sum_below_line(
+        args.dataset,
+        args.line_json,
+        args.output,
+        min_intensity=args.min_intensity,
+        threads=args.threads,
+        frame_stride=args.frame_stride,
+    )
+    print(f"Saved below/above-line TIC to {output}")
 
 
 def main() -> None:
