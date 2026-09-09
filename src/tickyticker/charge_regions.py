@@ -65,15 +65,58 @@ class LineTicResult:
 
     tic_below_line: int
     tic_above_line: int
+    frame_ids: np.ndarray
+    retention_times_seconds: np.ndarray
+    tic_below_line_per_frame: np.ndarray
+    tic_above_line_per_frame: np.ndarray
+    raw_tic_per_frame: np.ndarray
     line_intercept: float
     line_slope: float
     mz_min: float
     mz_max: float
+    rt_min: float
+    rt_max: float
     min_intensity: float
     frame_stride: int
     visited_ms1_frames: int
     runtime_seconds: float
     effective_threads: int
+
+
+def _validate_retention_time_limits(rt_min: float, rt_max: float) -> None:
+    """Validate a non-negative half-open-ended retention-time interval."""
+    if not np.isfinite(rt_min) or rt_min < 0:
+        raise ValueError("Minimum retention time must be finite and nonnegative.")
+    if not (np.isfinite(rt_max) or np.isposinf(rt_max)):
+        raise ValueError("Maximum retention time must be finite or positive infinity.")
+    if rt_max <= rt_min:
+        raise ValueError("Retention-time limits must be ordered.")
+
+
+def _selected_ms1_frames(
+    dataset: OpenTIMS,
+    rt_min: float,
+    rt_max: float,
+    frame_stride: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return RT-filtered, strided MS1 frame IDs and their times in seconds."""
+    all_ms1_frames = np.asarray(dataset.ms1_frames, dtype=np.uint32)
+    if not all_ms1_frames.size:
+        raise RuntimeError("No MS1 frames were found.")
+    all_retention_times = np.asarray(
+        dataset.frame_to_retention_time(all_ms1_frames), dtype=np.float64
+    )
+    in_range = (all_retention_times >= rt_min) & (
+        all_retention_times <= rt_max
+    )
+    frames = all_ms1_frames[in_range][::frame_stride]
+    retention_times = all_retention_times[in_range][::frame_stride]
+    if not frames.size:
+        maximum = "inf" if np.isposinf(rt_max) else f"{rt_max:g}"
+        raise RuntimeError(
+            f"No MS1 frames fall inside retention-time range {rt_min:g}–{maximum} s."
+        )
+    return frames, retention_times
 
 
 @njit(cache=True, parallel=True)
@@ -379,6 +422,8 @@ def analyse_line_tic(
     min_intensity: float = 30.0,
     threads: int = 3,
     frame_stride: int = 1,
+    rt_min: float = 0.0,
+    rt_max: float = np.inf,
     progress: Callable[[str], None] | None = None,
 ) -> LineTicResult:
     """Return thresholded MS1 TIC below and on/above a fitted line."""
@@ -391,6 +436,7 @@ def analyse_line_tic(
         raise ValueError("Minimum intensity must be finite and nonnegative.")
     if not np.isfinite(intercept) or not np.isfinite(slope):
         raise ValueError("Line intercept and slope must be finite.")
+    _validate_retention_time_limits(rt_min, rt_max)
     if not dataset_path.is_dir():
         raise FileNotFoundError(f"Dataset directory not found: {dataset_path}")
 
@@ -399,11 +445,9 @@ def analyse_line_tic(
     if not opentimspy.bruker_bridge_present:
         opentimspy.setup_opensource()
     with OpenTIMS(dataset_path) as dataset:
-        ms1_frames = np.asarray(dataset.ms1_frames, dtype=np.uint32)[
-            ::frame_stride
-        ]
-        if not ms1_frames.size:
-            raise RuntimeError("No MS1 frames were found.")
+        ms1_frames, retention_times = _selected_ms1_frames(
+            dataset, rt_min, rt_max, frame_stride
+        )
         scan_numbers = np.arange(
             dataset.min_scan, dataset.max_scan + 1, dtype=np.uint32
         )
@@ -427,9 +471,14 @@ def analyse_line_tic(
         )
         partial_below_tic = np.zeros(scan_mobility.size, dtype=np.uint64)
         partial_above_tic = np.zeros(scan_mobility.size, dtype=np.uint64)
+        below_per_frame = np.zeros(ms1_frames.size, dtype=np.uint64)
+        above_per_frame = np.zeros(ms1_frames.size, dtype=np.uint64)
+        raw_per_frame = np.zeros(ms1_frames.size, dtype=np.uint64)
         for frame_number, frame in enumerate(
             dataset.query_iter(ms1_frames, columns=_COLUMNS), start=1
         ):
+            partial_below_tic.fill(0)
+            partial_above_tic.fill(0)
             _sum_line_sides_frame(
                 frame["scan"],
                 frame["tof"],
@@ -443,16 +492,33 @@ def analyse_line_tic(
                 partial_below_tic,
                 partial_above_tic,
             )
+            result_index = frame_number - 1
+            below_per_frame[result_index] = partial_below_tic.sum(
+                dtype=np.uint64
+            )
+            above_per_frame[result_index] = partial_above_tic.sum(
+                dtype=np.uint64
+            )
+            raw_per_frame[result_index] = frame["intensity"].sum(
+                dtype=np.uint64
+            )
             if progress is not None and frame_number % 100 == 0:
                 progress(f"Processed {frame_number} MS1 frames")
 
     result = LineTicResult(
-        tic_below_line=int(partial_below_tic.sum(dtype=np.uint64)),
-        tic_above_line=int(partial_above_tic.sum(dtype=np.uint64)),
+        tic_below_line=int(below_per_frame.sum(dtype=np.uint64)),
+        tic_above_line=int(above_per_frame.sum(dtype=np.uint64)),
+        frame_ids=ms1_frames.copy(),
+        retention_times_seconds=retention_times.copy(),
+        tic_below_line_per_frame=below_per_frame,
+        tic_above_line_per_frame=above_per_frame,
+        raw_tic_per_frame=raw_per_frame,
         line_intercept=float(intercept),
         line_slope=float(slope),
         mz_min=float(mz_min),
         mz_max=float(mz_max),
+        rt_min=float(rt_min),
+        rt_max=float(rt_max),
         min_intensity=float(min_intensity),
         frame_stride=frame_stride,
         visited_ms1_frames=int(ms1_frames.size),
@@ -472,6 +538,8 @@ def sum_below_line(
     min_intensity: float = 0.0,
     threads: int = 3,
     frame_stride: int = 1,
+    rt_min: float = 0.0,
+    rt_max: float = np.inf,
 ) -> Path:
     """Save TIC on both sides of a JSON-defined line; retain the legacy name."""
     dataset_path = Path(dataset_path)
@@ -489,6 +557,8 @@ def sum_below_line(
         min_intensity=min_intensity,
         threads=threads,
         frame_stride=frame_stride,
+        rt_min=rt_min,
+        rt_max=rt_max,
     )
     payload = {
         "source_line_json": str(line_json_path.resolve()),
@@ -501,10 +571,31 @@ def sum_below_line(
         "tic_above_line": result.tic_above_line,
         "event_intensity_threshold": result.min_intensity,
         "analysis_mz_range": {"min": result.mz_min, "max": result.mz_max},
+        "analysis_rt_range_seconds": {
+            "min": result.rt_min,
+            "max": "inf" if np.isposinf(result.rt_max) else result.rt_max,
+        },
         "frame_stride": result.frame_stride,
         "visited_ms1_frames": result.visited_ms1_frames,
         "threads": result.effective_threads,
         "runtime_seconds": result.runtime_seconds,
+        "per_frame": [
+            {
+                "frame_id": int(frame_id),
+                "retention_time_seconds": float(retention_time),
+                "tic_below_line": int(below),
+                "tic_above_line": int(above),
+                "raw_tic": int(raw),
+            }
+            for frame_id, retention_time, below, above, raw in zip(
+                result.frame_ids,
+                result.retention_times_seconds,
+                result.tic_below_line_per_frame,
+                result.tic_above_line_per_frame,
+                result.raw_tic_per_frame,
+                strict=True,
+            )
+        ],
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(payload, indent=2) + "\n")
@@ -610,6 +701,8 @@ def analyse(
     border_mz_left: float = 350.0,
     border_mz_right: float = 1200.0,
     frame_stride: int = 1,
+    rt_min: float = 0.0,
+    rt_max: float = np.inf,
     threads: int = 3,
     scans_per_mobility_bin: int = 0,
     progress: Callable[[str], None] | None = None,
@@ -628,6 +721,7 @@ def analyse(
         raise ValueError("mz_bin_width must be an integer multiple of 1/12 Da.")
     if min_intensity < 0 or frame_stride < 1 or threads < 1 or scans_per_mobility_bin < 0:
         raise ValueError("min_intensity must be non-negative, frame_stride and threads at least 1, and scan sampling non-negative.")
+    _validate_retention_time_limits(rt_min, rt_max)
     if not mz_min <= border_mz_left < border_mz_right <= mz_max:
         raise ValueError("border m/z limits must be ordered and lie within the analysis m/z range.")
     if not dataset_path.is_dir():
@@ -649,9 +743,9 @@ def analyse(
     if not opentimspy.bruker_bridge_present:
         opentimspy.setup_opensource()
     with OpenTIMS(dataset_path) as dataset:
-        ms1_frames = np.asarray(dataset.ms1_frames, dtype=np.uint32)[::frame_stride]
-        if not ms1_frames.size:
-            raise RuntimeError("No MS1 frames were found.")
+        ms1_frames, retention_times = _selected_ms1_frames(
+            dataset, rt_min, rt_max, frame_stride
+        )
         scan_numbers = np.arange(dataset.min_scan, dataset.max_scan + 1, dtype=np.uint32)
         scan_mobility = dataset.scan_to_inv_ion_mobility(
             scan_numbers, np.full(scan_numbers.size, ms1_frames[0], dtype=np.uint32)
@@ -717,6 +811,12 @@ def analyse(
         "analysis_mz_range": {"min": mz_min, "max": mz_max},
         "fit_mz_range": {"min": border_mz_left, "max": border_mz_right},
         "min_intensity": min_intensity,
+        "analysis_rt_range_seconds": {
+            "min": float(rt_min),
+            "max": "inf" if np.isposinf(rt_max) else float(rt_max),
+            "effective_min": float(retention_times[0]),
+            "effective_max": float(retention_times[-1]),
+        },
         "visited_ms1_frames": int(ms1_frames.size),
     }
     runtime_seconds = perf_counter() - started
@@ -785,6 +885,10 @@ def analyse(
         threads=np.array(get_num_threads()),
         scans_per_mobility_bin=np.array(scans_per_mobility_bin),
         frame_stride=np.array(frame_stride),
+        rt_min=np.array(rt_min),
+        rt_max=np.array(rt_max),
+        selected_ms1_frame_ids=ms1_frames,
+        selected_ms1_retention_times_seconds=retention_times,
         visited_ms1_frames=np.array(ms1_frames.size),
         runtime_seconds=np.array(runtime_seconds),
     )
@@ -830,6 +934,8 @@ def tic_main() -> None:
     parser.add_argument("--min-intensity", type=float, default=0.0)
     parser.add_argument("--threads", type=int, default=3)
     parser.add_argument("--frame-stride", type=int, default=1)
+    parser.add_argument("--rt-min", type=float, default=0.0, help="Minimum retention time in seconds.")
+    parser.add_argument("--rt-max", type=float, default=np.inf, help="Maximum retention time in seconds (default: inf).")
     args = parser.parse_args()
     output = sum_below_line(
         args.dataset,
@@ -838,6 +944,8 @@ def tic_main() -> None:
         min_intensity=args.min_intensity,
         threads=args.threads,
         frame_stride=args.frame_stride,
+        rt_min=args.rt_min,
+        rt_max=args.rt_max,
     )
     print(f"Saved below/above-line TIC to {output}")
 
@@ -855,6 +963,8 @@ def main() -> None:
     parser.add_argument("--border-mz-left", type=float, default=350.0, help="Left m/z limit for border fitting and aggregation.")
     parser.add_argument("--border-mz-right", type=float, default=1200.0, help="Right m/z limit for border fitting and aggregation.")
     parser.add_argument("--frame-stride", type=int, default=1, help="Visit every K-th MS1 frame (default: 1).")
+    parser.add_argument("--rt-min", type=float, default=0.0, help="Minimum retention time in seconds.")
+    parser.add_argument("--rt-max", type=float, default=np.inf, help="Maximum retention time in seconds (default: inf).")
     parser.add_argument("--threads", type=int, default=3)
     parser.add_argument("--scans-per-mobility-bin", type=int, default=0)
     args = parser.parse_args()
@@ -863,6 +973,7 @@ def main() -> None:
         mobility_bins=args.mobility_bins, mz_min=args.mz_min, mz_max=args.mz_max, mz_bin_width=args.mz_bin_width,
         min_intensity=args.min_intensity, border_mz_left=args.border_mz_left, border_mz_right=args.border_mz_right,
         frame_stride=args.frame_stride, threads=args.threads,
+        rt_min=args.rt_min, rt_max=args.rt_max,
         scans_per_mobility_bin=args.scans_per_mobility_bin,
         progress=print,
     )
