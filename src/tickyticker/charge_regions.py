@@ -499,7 +499,11 @@ def analyse_line_tic(
             above_per_frame[result_index] = partial_above_tic.sum(
                 dtype=np.uint64
             )
-            raw_per_frame[result_index] = frame["intensity"].sum(
+            # Raw means unthresholded, but uses the same requested m/z range.
+            in_mz_range = (frame["tof"] >= fine_tof_edges[0]) & (
+                frame["tof"] < fine_tof_edges[-1]
+            )
+            raw_per_frame[result_index] = frame["intensity"][in_mz_range].sum(
                 dtype=np.uint64
             )
             if progress is not None and frame_number % 100 == 0:
