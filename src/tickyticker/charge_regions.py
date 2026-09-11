@@ -7,7 +7,9 @@ from time import perf_counter
 import argparse
 import json
 import multiprocessing as mp
+import threading
 from concurrent.futures import ProcessPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -493,7 +495,55 @@ def _split_frame_indices(n_frames: int, n_chunks: int) -> list[np.ndarray]:
     return [np.arange(offset, n_frames, n_chunks) for offset in range(n_chunks)]
 
 
-def _worker_pool(max_workers: int) -> ProcessPoolExecutor:
+def _idle_worker() -> None:
+    """No-op task used only to force a worker process to actually spawn."""
+    return None
+
+
+_prewarmed_pool: ProcessPoolExecutor | None = None
+_prewarmed_pool_lock = threading.Lock()
+
+
+def prewarm_worker_pool(max_workers: int = _DEFAULT_WORKER_PROCESSES) -> None:
+    """Create a persistent worker pool now, with every worker actually alive.
+
+    Spawning new multiprocessing workers concurrently with an active asyncio
+    event loop running elsewhere in this process (e.g. a long-lived Textual
+    app's event loop, while analyse()/analyse_line_tic() run in a worker
+    thread) is racy: observed both BrokenProcessPool and a spurious "attempt
+    has been made to start a new process before the current process has
+    finished its bootstrapping phase" RuntimeError, neither reproducible
+    without that concurrent event-loop activity. Once workers are alive,
+    submitting work to them doesn't touch that risky spawn/bootstrap path
+    again, so callers that have an event loop should call this once, early,
+    before starting it - the same principle as pre-starting
+    multiprocessing.resource_tracker before anything redirects sys.stderr.
+
+    ProcessPoolExecutor spawns workers lazily (on first submit(), and only
+    as many as the pending work needs), so merely constructing it here is
+    not enough - it wouldn't stop the real spawn from happening later,
+    during the very event-loop activity this function exists to avoid.
+    Submitting one no-op task per worker and waiting for all of them forces
+    every worker to actually start now, while it's safe.
+
+    Safe to call multiple times (only the first call takes effect) and
+    unnecessary for callers with no concurrent event loop (a one-shot CLI
+    script, say): analyse()/analyse_line_tic() fall back to creating and
+    tearing down an ordinary pool per call when this hasn't been called.
+    """
+    global _prewarmed_pool
+    with _prewarmed_pool_lock:
+        if _prewarmed_pool is not None:
+            return
+        pool = ProcessPoolExecutor(max_workers=max_workers, mp_context=mp.get_context("spawn"))
+        futures = [pool.submit(_idle_worker) for _ in range(max_workers)]
+        for future in futures:
+            future.result()
+        _prewarmed_pool = pool
+
+
+@contextmanager
+def _worker_pool(max_workers: int):
     """A process pool safe to start even after this process has used numba/OpenMP.
 
     Forking a process that has already initialised OpenMP (which any prior
@@ -506,8 +556,20 @@ def _worker_pool(max_workers: int) -> ProcessPoolExecutor:
     (cheaper than spawn, and immune to the same hazard by forking from an
     early, thread-free server process instead) but isn't usable in this
     sandboxed environment (its startup handshake gets a connection reset).
+
+    Reuses the pool from prewarm_worker_pool() if one was created (ignoring
+    max_workers - it's fixed at whatever size that call used), else creates
+    and tears down an ordinary one; see prewarm_worker_pool for why that
+    matters for callers with a concurrent event loop.
     """
-    return ProcessPoolExecutor(max_workers=max_workers, mp_context=mp.get_context("spawn"))
+    if _prewarmed_pool is not None:
+        yield _prewarmed_pool
+        return
+    pool = ProcessPoolExecutor(max_workers=max_workers, mp_context=mp.get_context("spawn"))
+    try:
+        yield pool
+    finally:
+        pool.shutdown(wait=True)
 
 
 def _line_tic_chunk_worker(args: tuple) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
