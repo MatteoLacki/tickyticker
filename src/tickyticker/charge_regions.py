@@ -419,20 +419,33 @@ def _sum_line_sides_frame(
     scan: np.ndarray,
     tof: np.ndarray,
     intensity: np.ndarray,
-    scan_mobility: np.ndarray,
-    fine_mz_tof_edges: np.ndarray,
-    fine_mz_centers: np.ndarray,
-    intercept: float,
-    slope: float,
+    critical_tof: np.ndarray,
+    direction: float,
+    tof_lo: float,
+    tof_hi: float,
     min_intensity: float,
     partial_below_tic: np.ndarray,
     partial_above_tic: np.ndarray,
 ) -> None:
-    """Sum filtered raw intensity on both line sides, parallel over scans."""
+    """Sum filtered raw intensity on both line sides, parallel over scans.
+
+    critical_tof[scan] is the exact raw tof value where the fitted
+    mobility = intercept + slope*mz line crosses that scan's exact mobility
+    (both converted once, outside this kernel, via the real tof<->m/z and
+    scan<->mobility calibration). Comparing each peak's own tof directly
+    against it needs no per-peak m/z binning, Bruker conversion, or
+    bin-center rounding.
+
+    A precomputed (tof, scan) boolean lookup table was tried instead of this
+    arithmetic and gave bit-identical results, but was consistently slower
+    (~25-30% in benchmarking): at ~190MB it doesn't fit cache, so a per-peak
+    lookup is a near-random main-memory access, whereas critical_tof[scan] is
+    loaded once per scan and stays hot for every peak in it.
+    """
     if scan.size == 0:
         return
-    starts = np.full(scan_mobility.size, -1, dtype=np.int64)
-    stops = np.full(scan_mobility.size, -1, dtype=np.int64)
+    starts = np.full(critical_tof.size, -1, dtype=np.int64)
+    stops = np.full(critical_tof.size, -1, dtype=np.int64)
     previous_scan = scan[0]
     starts[previous_scan] = 0
     for peak_index in range(1, scan.size):
@@ -442,29 +455,23 @@ def _sum_line_sides_frame(
             starts[current_scan] = peak_index
             previous_scan = current_scan
     stops[previous_scan] = scan.size
-    for scan_number in prange(scan_mobility.size):
+    for scan_number in prange(critical_tof.size):
         start = starts[scan_number]
         if start < 0:
             continue
         below_total = np.uint64(0)
         above_total = np.uint64(0)
+        crit = critical_tof[scan_number]
         for peak_index in range(start, stops[scan_number]):
             if intensity[peak_index] < min_intensity:
                 continue
-            fine_bin = (
-                np.searchsorted(
-                    fine_mz_tof_edges, tof[peak_index], side="right"
-                )
-                - 1
-            )
-            if 0 <= fine_bin < fine_mz_centers.size:
-                if (
-                    scan_mobility[scan_number]
-                    < intercept + slope * fine_mz_centers[fine_bin]
-                ):
-                    below_total += np.uint64(intensity[peak_index])
-                else:
-                    above_total += np.uint64(intensity[peak_index])
+            peak_tof = tof[peak_index]
+            if peak_tof < tof_lo or peak_tof >= tof_hi:
+                continue
+            if (peak_tof - crit) * direction > 0.0:
+                below_total += np.uint64(intensity[peak_index])
+            else:
+                above_total += np.uint64(intensity[peak_index])
         partial_below_tic[scan_number] += below_total
         partial_above_tic[scan_number] += above_total
 
@@ -493,6 +500,8 @@ def analyse_line_tic(
         raise ValueError("Minimum intensity must be finite and nonnegative.")
     if not np.isfinite(intercept) or not np.isfinite(slope):
         raise ValueError("Line intercept and slope must be finite.")
+    if slope == 0.0:
+        raise ValueError("Line slope must be nonzero.")
     _validate_retention_time_limits(rt_min, rt_max)
     if not dataset_path.is_dir():
         raise FileNotFoundError(f"Dataset directory not found: {dataset_path}")
@@ -512,22 +521,24 @@ def analyse_line_tic(
             scan_numbers,
             np.full(scan_numbers.size, ms1_frames[0], dtype=np.uint32),
         )
-        scan_mobility = np.zeros(dataset.max_scan + 1, dtype=np.float64)
-        scan_mobility[scan_numbers] = scan_mobility_values
-        fine_bin_count = int(
-            round((mz_max - mz_min) / _FINE_MZ_BIN_WIDTH)
+        # The fitted line crosses each scan's exact mobility at exactly one m/z;
+        # convert that critical m/z to tof once per scan (not per peak, and with
+        # no m/z-bin rounding) so the hot loop is a plain tof comparison.
+        critical_mz_values = (scan_mobility_values - intercept) / slope
+        critical_tof_values = dataset.mz_to_tof_frame_sorted(
+            critical_mz_values,
+            np.full(critical_mz_values.size, ms1_frames[0], dtype=np.uint32),
+        ).astype(np.float64)
+        critical_tof = np.zeros(dataset.max_scan + 1, dtype=np.float64)
+        critical_tof[scan_numbers] = critical_tof_values
+        direction = 1.0 if slope > 0.0 else -1.0
+        tof_bounds = dataset.mz_to_tof_frame_sorted(
+            np.array([mz_min, mz_max], dtype=np.float64),
+            np.full(2, ms1_frames[0], dtype=np.uint32),
         )
-        fine_edges = (
-            mz_min
-            + np.arange(fine_bin_count + 1) * _FINE_MZ_BIN_WIDTH
-        )
-        fine_centers = (fine_edges[:-1] + fine_edges[1:]) / 2.0
-        fine_tof_edges = dataset.mz_to_tof_frame_sorted(
-            fine_edges,
-            np.full(fine_edges.size, ms1_frames[0], dtype=np.uint32),
-        )
-        partial_below_tic = np.zeros(scan_mobility.size, dtype=np.uint64)
-        partial_above_tic = np.zeros(scan_mobility.size, dtype=np.uint64)
+        tof_lo, tof_hi = float(tof_bounds[0]), float(tof_bounds[1])
+        partial_below_tic = np.zeros(critical_tof.size, dtype=np.uint64)
+        partial_above_tic = np.zeros(critical_tof.size, dtype=np.uint64)
         below_per_frame = np.zeros(ms1_frames.size, dtype=np.uint64)
         above_per_frame = np.zeros(ms1_frames.size, dtype=np.uint64)
         raw_per_frame = np.zeros(ms1_frames.size, dtype=np.uint64)
@@ -540,11 +551,10 @@ def analyse_line_tic(
                 frame["scan"],
                 frame["tof"],
                 frame["intensity"],
-                scan_mobility,
-                fine_tof_edges,
-                fine_centers,
-                intercept,
-                slope,
+                critical_tof,
+                direction,
+                tof_lo,
+                tof_hi,
                 min_intensity,
                 partial_below_tic,
                 partial_above_tic,
@@ -557,8 +567,8 @@ def analyse_line_tic(
                 dtype=np.uint64
             )
             # Raw means unthresholded, but uses the same requested m/z range.
-            in_mz_range = (frame["tof"] >= fine_tof_edges[0]) & (
-                frame["tof"] < fine_tof_edges[-1]
+            in_mz_range = (frame["tof"] >= tof_lo) & (
+                frame["tof"] < tof_hi
             )
             raw_per_frame[result_index] = frame["intensity"][in_mz_range].sum(
                 dtype=np.uint64
