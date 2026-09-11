@@ -312,6 +312,69 @@ def fit_polar_charge_border(
 
 
 
+def _theil_sen_line(x: np.ndarray, y: np.ndarray) -> tuple[float, float]:
+    """Fit y = a + b*x by the Theil-Sen median-of-pairwise-slopes estimator.
+
+    b = median_{i<j} (y_j - y_i) / (x_j - x_i); a = median_i (y_i - b*x_i).
+    Robust (29% breakdown point) and, unlike an intersection of two fitted
+    lines, never blows up when the underlying data is close to collinear.
+    """
+    i, j = np.triu_indices(x.size, k=1)
+    dx = x[j] - x[i]
+    valid = dx != 0
+    if not np.any(valid):
+        raise RuntimeError("Theil-Sen fit requires at least two boundary points with distinct m/z.")
+    slope = float(np.median((y[j][valid] - y[i][valid]) / dx[valid]))
+    intercept = float(np.median(y - slope * x))
+    return intercept, slope
+
+
+def _per_column_charge_boundary(
+    dominant: np.ndarray,
+    weights: np.ndarray,
+    mz_centers: np.ndarray,
+    mobility_centers: np.ndarray,
+    considered: np.ndarray,
+    charge_above: int,
+    charge_below: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per m/z column, find the mobility split minimising weighted misclassification
+    between a higher-mobility charge class and a lower-mobility one.
+
+    For each column this is an O(bins) scan over candidate thresholds using
+    prefix sums of intensity-weighted class membership, so the whole sweep is
+    linear in the number of (mobility, m/z) cells considered.
+    """
+    boundary_mz = []
+    boundary_mobility = []
+    for column in np.flatnonzero(considered):
+        labels = dominant[:, column]
+        above_count = np.count_nonzero(labels == charge_above)
+        below_count = np.count_nonzero(labels == charge_below)
+        if above_count < 2 or below_count < 2:
+            continue
+        signal = (labels == charge_above) | (labels == charge_below)
+        order = np.argsort(mobility_centers[signal])
+        mob = mobility_centers[signal][order]
+        is_above = (labels[signal] == charge_above)[order]
+        weight = weights[:, column][signal][order]
+        cumulative_above = np.concatenate(([0.0], np.cumsum(weight * is_above)))
+        cumulative_below = np.concatenate(([0.0], np.cumsum(weight * ~is_above)))
+        total_below = cumulative_below[-1]
+        # threshold t: rows [0, t) predicted charge_below, rows [t, end) predicted charge_above.
+        misclassified = cumulative_above + (total_below - cumulative_below)
+        best = int(np.argmin(misclassified))
+        if best == 0:
+            split = mob[0]
+        elif best == mob.size:
+            split = mob[-1]
+        else:
+            split = (mob[best - 1] + mob[best]) / 2.0
+        boundary_mz.append(mz_centers[column])
+        boundary_mobility.append(split)
+    return np.array(boundary_mz), np.array(boundary_mobility)
+
+
 def fit_alpha_separator_line(
     intensities: np.ndarray,
     all_ms1_intensities: np.ndarray,
@@ -319,42 +382,36 @@ def fit_alpha_separator_line(
     mobility_edges: np.ndarray,
     border_mz_left: float,
     border_mz_right: float,
-) -> tuple[float, float, float, np.ndarray, np.ndarray]:
-    """Fit the original-coordinate line from robust 1+/2+ axes and alpha overlap."""
+) -> tuple[float, float, np.ndarray, np.ndarray]:
+    """Fit the 1+/2+ separator through per-m/z-bin optimal splits.
+
+    For each m/z column, pick the ion-mobility threshold that best separates
+    dominant-1+ from dominant-2+ cells (minimising weighted misclassification),
+    then fit one robust Theil-Sen line through the resulting boundary points.
+    This never needs to intersect the 1+ and 2+ axis lines, so it stays stable
+    even when those axes are nearly parallel (their intersection is an
+    ill-conditioned computation: a small change in either fitted slope can
+    move the intersection point, and therefore the derived separator, by a
+    huge amount).
+    """
     dominant = dominant_charge_map(intensities)
     mz_centers = (mz_edges[:-1] + mz_edges[1:]) / 2.0
     mobility_centers = (mobility_edges[:-1] + mobility_edges[1:]) / 2.0
-    interior = (mz_centers >= border_mz_left + 3.0) & (mz_centers <= border_mz_right - 3.0)
     considered = (mz_centers >= border_mz_left) & (mz_centers <= border_mz_right)
-    grid_mz, grid_mobility = np.meshgrid(mz_centers, mobility_centers)
     weights = np.maximum(all_ms1_intensities, 1.0)
-    lines = []
-    for charge in (1, 2):
-        mask = (dominant == charge) & interior[None, :]
-        if np.count_nonzero(mask) < 3:
-            raise RuntimeError(f"At least three uncensored dominant {charge}+ cells are required for line fitting.")
-        lines.append(_robust_line_fit(grid_mz[mask], grid_mobility[mask], weights[mask]))
-    line_one, line_two = lines
-    slope_difference = line_one[1] - line_two[1]
-    if abs(slope_difference) < 1e-10:
-        raise RuntimeError("Robust 1+ and 2+ axes are effectively parallel; line origin is undefined.")
-    origin_mz = (line_two[0] - line_one[0]) / slope_difference
-    origin_mobility = line_one[0] + line_one[1] * origin_mz
-    cloud = ((dominant == 1) | (dominant == 2)) & considered[None, :]
-    alpha = np.arctan2(grid_mobility[cloud] - origin_mobility, grid_mz[cloud] - origin_mz)
-    one = dominant[cloud] == 1
-    if not np.any(one) or np.all(one):
-        raise RuntimeError("Both dominant 1+ and 2+ cells are required for alpha line fitting.")
-    alpha_one = np.quantile(alpha[one], (0.05, 0.95))
-    alpha_two = np.quantile(alpha[~one], (0.05, 0.95))
-    lower, upper = max(alpha_one[0], alpha_two[0]), min(alpha_one[1], alpha_two[1])
-    # A gap is an even cleaner separation than an overlap; its midpoint remains the border.
-    separator_alpha = (lower + upper) / 2.0
-    slope = float(np.tan(separator_alpha))
-    if not np.isfinite(slope):
+
+    boundary_mz, boundary_mobility = _per_column_charge_boundary(
+        dominant, weights, mz_centers, mobility_centers, considered,
+        charge_above=1, charge_below=2,
+    )
+    if boundary_mz.size < 5:
+        raise RuntimeError(
+            "Too few m/z columns have both dominant 1+ and 2+ cells to fit a stable separator."
+        )
+    intercept, slope = _theil_sen_line(boundary_mz, boundary_mobility)
+    if not np.isfinite(slope) or not np.isfinite(intercept):
         raise RuntimeError("Alpha separator is vertical and cannot be represented as mobility = intercept + slope*mz.")
-    intercept = float(origin_mobility - slope * origin_mz)
-    return intercept, slope, float(separator_alpha), np.array((origin_mz, origin_mobility)), np.stack((line_one, line_two))
+    return intercept, slope, boundary_mz, boundary_mobility
 
 
 @njit(cache=True, parallel=True)
@@ -803,15 +860,17 @@ def analyse(
         intensities, all_ms1_intensities, mz_edges, mobility_edges, border_mz_left, border_mz_right
     )
     non_one_ms1_intensity = all_ms1_intensities[(~one_mask) & border_mz_mask[None, :]].sum()
-    line_intercept, line_slope, line_alpha, line_origin, line_axes = fit_alpha_separator_line(
+    line_intercept, line_slope, boundary_mz, boundary_mobility = fit_alpha_separator_line(
         intensities, all_ms1_intensities, mz_edges, mobility_edges, border_mz_left, border_mz_right
     )
     line_data: dict[str, object] = {
-        "model": "robust_1_2_axes_alpha_separator",
+        "model": "theil_sen_per_column_boundary",
         "line": {"intercept": line_intercept, "slope": line_slope},
-        "separator_alpha_radians": line_alpha,
-        "origin": {"mz": float(line_origin[0]), "inv_ion_mobility": float(line_origin[1])},
-        "robust_axis_coefficients": {"charge_1": {"intercept": float(line_axes[0, 0]), "slope": float(line_axes[0, 1])}, "charge_2": {"intercept": float(line_axes[1, 0]), "slope": float(line_axes[1, 1])}},
+        "boundary_points": {
+            "mz": boundary_mz.tolist(),
+            "inv_ion_mobility": boundary_mobility.tolist(),
+            "count": int(boundary_mz.size),
+        },
         "analysis_mz_range": {"min": mz_min, "max": mz_max},
         "fit_mz_range": {"min": border_mz_left, "max": border_mz_right},
         "min_intensity": min_intensity,
@@ -872,7 +931,8 @@ def analyse(
         border_line_two_coefficients=line_two,
         alpha_separator_line_intercept=np.array(line_intercept),
         alpha_separator_line_slope=np.array(line_slope),
-        alpha_separator_line_alpha=np.array(line_alpha),
+        alpha_separator_boundary_mz=boundary_mz,
+        alpha_separator_boundary_inv_ion_mobility=boundary_mobility,
         border_polar_radius=np.array(polar_boundary_radius),
         border_polar_boundary=polar_boundary,
         border_one_charge_is_inner=np.array(one_inner),
