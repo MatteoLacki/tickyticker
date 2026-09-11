@@ -6,8 +6,9 @@ from time import perf_counter
 
 import argparse
 import json
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
-from itertools import chain
 from pathlib import Path
 from typing import Callable
 
@@ -31,6 +32,16 @@ CHARGES = np.array([1, 2, 3], dtype=np.int64)
 _COLUMNS = ("scan", "tof", "intensity")
 _FINE_MZ_BIN_WIDTH = 1.0 / 12.0
 _ISOTOPE_BIN_STEPS = np.array([12, 6, 4], dtype=np.int64)
+
+# Per-frame fetch+decompress (opentimspy's open-source reader, no Bruker bridge)
+# is single-core CPU-bound and dominates wall time (~78% of it, measured); the
+# numba-parallel kernels below barely benefit from more intra-frame threads
+# (measured flat from 1 to 24 threads on an 8000+-frame dataset). Splitting
+# frames across worker *processes* instead (bypassing the GIL, unlike threads)
+# gave a near-linear speedup up to this many workers on a 32-core machine
+# before diminishing returns set in. Deliberately conservative (not the
+# measured 16-24 sweet spot) since this runs on a shared server.
+_DEFAULT_WORKER_PROCESSES = 12
 
 
 @dataclass(frozen=True, slots=True)
@@ -476,6 +487,58 @@ def _sum_line_sides_frame(
         partial_above_tic[scan_number] += above_total
 
 
+def _split_frame_indices(n_frames: int, n_chunks: int) -> list[np.ndarray]:
+    """Interleave frame indices into n_chunks roughly-equal-sized groups."""
+    n_chunks = max(1, min(n_chunks, n_frames))
+    return [np.arange(offset, n_frames, n_chunks) for offset in range(n_chunks)]
+
+
+def _worker_pool(max_workers: int) -> ProcessPoolExecutor:
+    """A process pool safe to start even after this process has used numba/OpenMP.
+
+    Forking a process that has already initialised OpenMP (which any prior
+    @njit(parallel=True) call in this same process does) is refused by glibc
+    at runtime ("fork() called from a process already using GNU OpenMP, this
+    is unsafe."), and that's a real scenario here: this process is
+    long-lived, and analyse()/analyse_line_tic() both use parallel numba
+    kernels. spawn avoids it by starting a fresh interpreter per worker
+    instead of forking this one. forkserver would normally be preferable
+    (cheaper than spawn, and immune to the same hazard by forking from an
+    early, thread-free server process instead) but isn't usable in this
+    sandboxed environment (its startup handshake gets a connection reset).
+    """
+    return ProcessPoolExecutor(max_workers=max_workers, mp_context=mp.get_context("spawn"))
+
+
+def _line_tic_chunk_worker(args: tuple) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Compute below/above/raw per-frame TIC for one chunk of frames, in its own process."""
+    (
+        dataset_path, frame_ids, indices, critical_tof, direction, tof_lo, tof_hi, min_intensity,
+    ) = args
+    if not opentimspy.bruker_bridge_present:
+        opentimspy.setup_opensource()
+    set_num_threads(1)
+    below_chunk = np.zeros(indices.size, dtype=np.uint64)
+    above_chunk = np.zeros(indices.size, dtype=np.uint64)
+    raw_chunk = np.zeros(indices.size, dtype=np.uint64)
+    partial_below = np.zeros(critical_tof.size, dtype=np.uint64)
+    partial_above = np.zeros(critical_tof.size, dtype=np.uint64)
+    with OpenTIMS(dataset_path) as dataset:
+        for position, frame in enumerate(dataset.query_iter(frame_ids, columns=_COLUMNS)):
+            partial_below.fill(0)
+            partial_above.fill(0)
+            _sum_line_sides_frame(
+                frame["scan"], frame["tof"], frame["intensity"],
+                critical_tof, direction, tof_lo, tof_hi, min_intensity,
+                partial_below, partial_above,
+            )
+            below_chunk[position] = partial_below.sum(dtype=np.uint64)
+            above_chunk[position] = partial_above.sum(dtype=np.uint64)
+            in_mz_range = (frame["tof"] >= tof_lo) & (frame["tof"] < tof_hi)
+            raw_chunk[position] = frame["intensity"][in_mz_range].sum(dtype=np.uint64)
+    return indices, below_chunk, above_chunk, raw_chunk
+
+
 def analyse_line_tic(
     dataset_path: Path | str,
     *,
@@ -488,12 +551,25 @@ def analyse_line_tic(
     frame_stride: int = 1,
     rt_min: float = 0.0,
     rt_max: float = np.inf,
+    worker_processes: int = _DEFAULT_WORKER_PROCESSES,
     progress: Callable[[str], None] | None = None,
 ) -> LineTicResult:
-    """Return thresholded MS1 TIC below and on/above a fitted line."""
+    """Return thresholded MS1 TIC below and on/above a fitted line.
+
+    Frame fetch+decompress dominates wall time and is single-core CPU-bound
+    (measured), so with worker_processes > 1 the frames are split across that
+    many worker processes (each with its own OpenTIMS handle), bypassing the
+    GIL; each worker pins its internal numba kernel to one thread to avoid
+    oversubscribing the machine, ignoring `threads` (which only matters for
+    the worker_processes=1 fallback path, and was measured to barely matter
+    there either - it's intra-frame parallelism over a per-frame bottleneck
+    that isn't the compute step).
+    """
     dataset_path = Path(dataset_path)
     if threads < 1 or frame_stride < 1:
         raise ValueError("threads and frame_stride must be at least 1.")
+    if worker_processes < 1:
+        raise ValueError("worker_processes must be at least 1.")
     if not np.isfinite(mz_min) or not np.isfinite(mz_max) or mz_min >= mz_max:
         raise ValueError("m/z limits must be finite and ordered.")
     if min_intensity < 0 or not np.isfinite(min_intensity):
@@ -537,44 +613,48 @@ def analyse_line_tic(
             np.full(2, ms1_frames[0], dtype=np.uint32),
         )
         tof_lo, tof_hi = float(tof_bounds[0]), float(tof_bounds[1])
-        partial_below_tic = np.zeros(critical_tof.size, dtype=np.uint64)
-        partial_above_tic = np.zeros(critical_tof.size, dtype=np.uint64)
-        below_per_frame = np.zeros(ms1_frames.size, dtype=np.uint64)
-        above_per_frame = np.zeros(ms1_frames.size, dtype=np.uint64)
-        raw_per_frame = np.zeros(ms1_frames.size, dtype=np.uint64)
-        for frame_number, frame in enumerate(
-            dataset.query_iter(ms1_frames, columns=_COLUMNS), start=1
-        ):
-            partial_below_tic.fill(0)
-            partial_above_tic.fill(0)
-            _sum_line_sides_frame(
-                frame["scan"],
-                frame["tof"],
-                frame["intensity"],
-                critical_tof,
-                direction,
-                tof_lo,
-                tof_hi,
-                min_intensity,
-                partial_below_tic,
-                partial_above_tic,
-            )
-            result_index = frame_number - 1
-            below_per_frame[result_index] = partial_below_tic.sum(
-                dtype=np.uint64
-            )
-            above_per_frame[result_index] = partial_above_tic.sum(
-                dtype=np.uint64
-            )
-            # Raw means unthresholded, but uses the same requested m/z range.
-            in_mz_range = (frame["tof"] >= tof_lo) & (
-                frame["tof"] < tof_hi
-            )
-            raw_per_frame[result_index] = frame["intensity"][in_mz_range].sum(
-                dtype=np.uint64
-            )
-            if progress is not None and frame_number % 100 == 0:
-                progress(f"Processed {frame_number} MS1 frames")
+
+    below_per_frame = np.zeros(ms1_frames.size, dtype=np.uint64)
+    above_per_frame = np.zeros(ms1_frames.size, dtype=np.uint64)
+    raw_per_frame = np.zeros(ms1_frames.size, dtype=np.uint64)
+
+    if worker_processes <= 1:
+        with OpenTIMS(dataset_path) as dataset:
+            partial_below_tic = np.zeros(critical_tof.size, dtype=np.uint64)
+            partial_above_tic = np.zeros(critical_tof.size, dtype=np.uint64)
+            for frame_number, frame in enumerate(
+                dataset.query_iter(ms1_frames, columns=_COLUMNS), start=1
+            ):
+                partial_below_tic.fill(0)
+                partial_above_tic.fill(0)
+                _sum_line_sides_frame(
+                    frame["scan"], frame["tof"], frame["intensity"],
+                    critical_tof, direction, tof_lo, tof_hi, min_intensity,
+                    partial_below_tic, partial_above_tic,
+                )
+                result_index = frame_number - 1
+                below_per_frame[result_index] = partial_below_tic.sum(dtype=np.uint64)
+                above_per_frame[result_index] = partial_above_tic.sum(dtype=np.uint64)
+                # Raw means unthresholded, but uses the same requested m/z range.
+                in_mz_range = (frame["tof"] >= tof_lo) & (frame["tof"] < tof_hi)
+                raw_per_frame[result_index] = frame["intensity"][in_mz_range].sum(dtype=np.uint64)
+                if progress is not None and frame_number % 100 == 0:
+                    progress(f"Processed {frame_number} MS1 frames")
+    else:
+        chunks = _split_frame_indices(ms1_frames.size, worker_processes)
+        tasks = [
+            (dataset_path, ms1_frames[indices], indices, critical_tof, direction, tof_lo, tof_hi, min_intensity)
+            for indices in chunks
+        ]
+        if progress is not None:
+            progress(f"Processing {ms1_frames.size} MS1 frames across {len(tasks)} workers")
+        with _worker_pool(len(tasks)) as pool:
+            for indices, below_chunk, above_chunk, raw_chunk in pool.map(_line_tic_chunk_worker, tasks):
+                below_per_frame[indices] = below_chunk
+                above_per_frame[indices] = above_chunk
+                raw_per_frame[indices] = raw_chunk
+        if progress is not None:
+            progress(f"Processed {ms1_frames.size} MS1 frames")
 
     result = LineTicResult(
         tic_below_line=int(below_per_frame.sum(dtype=np.uint64)),
@@ -594,7 +674,7 @@ def analyse_line_tic(
         frame_stride=frame_stride,
         visited_ms1_frames=int(ms1_frames.size),
         runtime_seconds=perf_counter() - started,
-        effective_threads=int(get_num_threads()),
+        effective_threads=worker_processes if worker_processes > 1 else int(get_num_threads()),
     )
     if progress is not None:
         progress("TIC analysis complete")
@@ -611,6 +691,7 @@ def sum_below_line(
     frame_stride: int = 1,
     rt_min: float = 0.0,
     rt_max: float = np.inf,
+    worker_processes: int = _DEFAULT_WORKER_PROCESSES,
 ) -> Path:
     """Save TIC on both sides of a JSON-defined line; retain the legacy name."""
     dataset_path = Path(dataset_path)
@@ -630,6 +711,7 @@ def sum_below_line(
         frame_stride=frame_stride,
         rt_min=rt_min,
         rt_max=rt_max,
+        worker_processes=worker_processes,
     )
     payload = {
         "source_line_json": str(line_json_path.resolve()),
@@ -759,6 +841,35 @@ def _plot_charge_border(
     plt.close(figure)
 
 
+def _charge_region_chunk_worker(args: tuple) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
+    """Accumulate charge-region intensities for one chunk of frames, in its own process."""
+    (
+        dataset_path, frame_ids, scan_mobility_bin_lookup, scan_selected, fine_mz_tof_edges,
+        isotope_count, min_intensity, fine_bins_per_output_mz_bin,
+        mobility_bins, mz_bin_count, fine_mz_bin_count,
+    ) = args
+    if not opentimspy.bruker_bridge_present:
+        opentimspy.setup_opensource()
+    set_num_threads(1)
+    intensities = np.zeros((len(CHARGES), mobility_bins, mz_bin_count), dtype=np.float64)
+    all_ms1_intensities = np.zeros((mobility_bins, mz_bin_count), dtype=np.float64)
+    event_histograms = np.zeros((mobility_bins, 128), dtype=np.uint64)
+    sampled_scans = np.zeros(mobility_bins, dtype=np.uint32)
+    workspaces = np.zeros((mobility_bins, fine_mz_bin_count), dtype=np.float64)
+    touched_bins = np.empty((mobility_bins, fine_mz_bin_count), dtype=np.int64)
+    visited = 0
+    with OpenTIMS(dataset_path) as dataset:
+        for frame in dataset.query_iter(frame_ids, columns=_COLUMNS):
+            _process_ms1_frame(
+                frame["scan"], frame["tof"], frame["intensity"], intensities, all_ms1_intensities,
+                event_histograms, sampled_scans, scan_mobility_bin_lookup, scan_selected,
+                fine_mz_tof_edges, workspaces, touched_bins, isotope_count, min_intensity,
+                fine_bins_per_output_mz_bin,
+            )
+            visited += 1
+    return intensities, all_ms1_intensities, event_histograms, sampled_scans, visited
+
+
 def analyse(
     dataset_path: Path | str,
     output_dir: Path | str | None = None,
@@ -776,6 +887,7 @@ def analyse(
     rt_max: float = np.inf,
     threads: int = 3,
     scans_per_mobility_bin: int = 0,
+    worker_processes: int = _DEFAULT_WORKER_PROCESSES,
     progress: Callable[[str], None] | None = None,
 ) -> ChargeRegionResult:
     """Analyse a dataset and optionally persist the complete CLI artifacts.
@@ -792,6 +904,8 @@ def analyse(
         raise ValueError("mz_bin_width must be an integer multiple of 1/12 Da.")
     if min_intensity < 0 or frame_stride < 1 or threads < 1 or scans_per_mobility_bin < 0:
         raise ValueError("min_intensity must be non-negative, frame_stride and threads at least 1, and scan sampling non-negative.")
+    if worker_processes < 1:
+        raise ValueError("worker_processes must be at least 1.")
     _validate_retention_time_limits(rt_min, rt_max)
     if not mz_min <= border_mz_left < border_mz_right <= mz_max:
         raise ValueError("border m/z limits must be ordered and lie within the analysis m/z range.")
@@ -841,27 +955,61 @@ def analyse(
         scan_mobility_bin_lookup = np.zeros(dataset.max_scan + 1, dtype=np.int64)
         scan_mobility_bin_lookup[scan_numbers] = scan_mobility_bins
 
-        frames = dataset.query_iter(ms1_frames, columns=_COLUMNS)
-        first_frame = next(frames)
         fine_mz_edges = mz_min + np.arange(fine_mz_bin_count + 1) * _FINE_MZ_BIN_WIDTH
         first_frame_numbers = np.full(fine_mz_edges.size, ms1_frames[0], dtype=np.uint32)
         fine_mz_tof_edges = dataset.mz_to_tof_frame_sorted(fine_mz_edges, first_frame_numbers)
 
-        intensities = np.zeros((len(CHARGES), mobility_bins, mz_edges.size - 1), dtype=np.float64)
-        all_ms1_intensities = np.zeros((mobility_bins, mz_edges.size - 1), dtype=np.float64)
+        mz_bin_count = mz_edges.size - 1
+        intensities = np.zeros((len(CHARGES), mobility_bins, mz_bin_count), dtype=np.float64)
+        all_ms1_intensities = np.zeros((mobility_bins, mz_bin_count), dtype=np.float64)
         event_histograms = np.zeros((mobility_bins, 128), dtype=np.uint64)
         sampled_scans = np.zeros(mobility_bins, dtype=np.uint32)
-        workspaces = np.zeros((mobility_bins, fine_mz_bin_count), dtype=np.float64)
-        touched_bins = np.empty((mobility_bins, fine_mz_bin_count), dtype=np.int64)
-        for frame_number, frame in enumerate(chain((first_frame,), frames), start=1):
-            _process_ms1_frame(
-                frame["scan"], frame["tof"], frame["intensity"], intensities, all_ms1_intensities, event_histograms,
-                sampled_scans,
-                scan_mobility_bin_lookup, scan_selected, fine_mz_tof_edges, workspaces,
-                touched_bins, isotope_count, min_intensity, fine_bins_per_output_mz_bin,
+
+        if worker_processes <= 1:
+            workspaces = np.zeros((mobility_bins, fine_mz_bin_count), dtype=np.float64)
+            touched_bins = np.empty((mobility_bins, fine_mz_bin_count), dtype=np.int64)
+            for frame_number, frame in enumerate(
+                dataset.query_iter(ms1_frames, columns=_COLUMNS), start=1
+            ):
+                _process_ms1_frame(
+                    frame["scan"], frame["tof"], frame["intensity"], intensities, all_ms1_intensities,
+                    event_histograms, sampled_scans, scan_mobility_bin_lookup, scan_selected,
+                    fine_mz_tof_edges, workspaces, touched_bins, isotope_count, min_intensity,
+                    fine_bins_per_output_mz_bin,
+                )
+                if progress is not None and frame_number % 100 == 0:
+                    progress(f"Processed {frame_number} MS1 frames")
+
+    if worker_processes > 1:
+        # Frame fetch+decompress (not this accumulation step) dominates wall time and is
+        # single-core CPU-bound, so split frames across worker processes instead - see
+        # _worker_pool for why that needs spawn, not fork. Each frame's contribution to
+        # intensities/all_ms1_intensities/event_histograms/sampled_scans is independent
+        # of every other frame's, so summing the workers' partial arrays afterward is
+        # exactly equivalent to the sequential accumulation above.
+        chunks = _split_frame_indices(ms1_frames.size, worker_processes)
+        tasks = [
+            (
+                dataset_path, ms1_frames[indices], scan_mobility_bin_lookup, scan_selected,
+                fine_mz_tof_edges, isotope_count, min_intensity, fine_bins_per_output_mz_bin,
+                mobility_bins, mz_bin_count, fine_mz_bin_count,
             )
-            if progress is not None and frame_number % 100 == 0:
-                progress(f"Processed {frame_number} MS1 frames")
+            for indices in chunks
+        ]
+        if progress is not None:
+            progress(f"Processing {ms1_frames.size} MS1 frames across {len(tasks)} workers")
+        visited_total = 0
+        with _worker_pool(len(tasks)) as pool:
+            for chunk_intensities, chunk_all_ms1, chunk_histograms, chunk_sampled, chunk_visited in pool.map(
+                _charge_region_chunk_worker, tasks
+            ):
+                intensities += chunk_intensities
+                all_ms1_intensities += chunk_all_ms1
+                event_histograms += chunk_histograms
+                sampled_scans += chunk_sampled
+                visited_total += chunk_visited
+        if progress is not None:
+            progress(f"Processed {ms1_frames.size} MS1 frames")
 
     raw_event_intensity_histogram = event_histograms.sum(axis=0, dtype=np.uint64)
     if progress is not None:
@@ -913,7 +1061,7 @@ def analyse(
         line_data=line_data,
         visited_ms1_frames=int(ms1_frames.size),
         runtime_seconds=runtime_seconds,
-        effective_threads=int(get_num_threads()),
+        effective_threads=worker_processes if worker_processes > 1 else int(get_num_threads()),
     )
     if resolved_output_dir is None:
         if progress is not None:
@@ -1010,6 +1158,9 @@ def tic_main() -> None:
     parser.add_argument("--frame-stride", type=int, default=1)
     parser.add_argument("--rt-min", type=float, default=0.0, help="Minimum retention time in seconds.")
     parser.add_argument("--rt-max", type=float, default=np.inf, help="Maximum retention time in seconds (default: inf).")
+    parser.add_argument("--worker-processes", type=int, default=_DEFAULT_WORKER_PROCESSES,
+                         help="Frame fetch+decompress dominates wall time and barely benefits from --threads; "
+                              "split frames across this many worker processes instead (default: %(default)s).")
     args = parser.parse_args()
     output = sum_below_line(
         args.dataset,
@@ -1020,6 +1171,7 @@ def tic_main() -> None:
         frame_stride=args.frame_stride,
         rt_min=args.rt_min,
         rt_max=args.rt_max,
+        worker_processes=args.worker_processes,
     )
     print(f"Saved below/above-line TIC to {output}")
 
@@ -1041,6 +1193,9 @@ def main() -> None:
     parser.add_argument("--rt-max", type=float, default=np.inf, help="Maximum retention time in seconds (default: inf).")
     parser.add_argument("--threads", type=int, default=3)
     parser.add_argument("--scans-per-mobility-bin", type=int, default=0)
+    parser.add_argument("--worker-processes", type=int, default=_DEFAULT_WORKER_PROCESSES,
+                         help="Frame fetch+decompress dominates wall time and barely benefits from --threads; "
+                              "split frames across this many worker processes instead (default: %(default)s).")
     args = parser.parse_args()
     analyse(
         args.dataset, args.output_dir, isotope_count=args.isotope_count,
@@ -1049,6 +1204,7 @@ def main() -> None:
         frame_stride=args.frame_stride, threads=args.threads,
         rt_min=args.rt_min, rt_max=args.rt_max,
         scans_per_mobility_bin=args.scans_per_mobility_bin,
+        worker_processes=args.worker_processes,
         progress=print,
     )
     print(f"Saved intensity maps to {args.output_dir / 'charge_region_maps.npz'}")
