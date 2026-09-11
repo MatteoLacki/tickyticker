@@ -8,7 +8,7 @@ import argparse
 import json
 import multiprocessing as mp
 import threading
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -701,7 +701,7 @@ def analyse_line_tic(
                 in_mz_range = (frame["tof"] >= tof_lo) & (frame["tof"] < tof_hi)
                 raw_per_frame[result_index] = frame["intensity"][in_mz_range].sum(dtype=np.uint64)
                 if progress is not None and frame_number % 100 == 0:
-                    progress(f"Processed {frame_number} MS1 frames")
+                    progress(f"Processed {frame_number}/{ms1_frames.size} MS1 frames")
     else:
         chunks = _split_frame_indices(ms1_frames.size, worker_processes)
         tasks = [
@@ -710,13 +710,17 @@ def analyse_line_tic(
         ]
         if progress is not None:
             progress(f"Processing {ms1_frames.size} MS1 frames across {len(tasks)} workers")
+        completed_frames = 0
         with _worker_pool(len(tasks)) as pool:
-            for indices, below_chunk, above_chunk, raw_chunk in pool.map(_line_tic_chunk_worker, tasks):
+            futures = [pool.submit(_line_tic_chunk_worker, task) for task in tasks]
+            for future in as_completed(futures):
+                indices, below_chunk, above_chunk, raw_chunk = future.result()
                 below_per_frame[indices] = below_chunk
                 above_per_frame[indices] = above_chunk
                 raw_per_frame[indices] = raw_chunk
-        if progress is not None:
-            progress(f"Processed {ms1_frames.size} MS1 frames")
+                if progress is not None:
+                    completed_frames += indices.size
+                    progress(f"Processed {completed_frames}/{ms1_frames.size} MS1 frames")
 
     result = LineTicResult(
         tic_below_line=int(below_per_frame.sum(dtype=np.uint64)),
@@ -1040,7 +1044,7 @@ def analyse(
                     fine_bins_per_output_mz_bin,
                 )
                 if progress is not None and frame_number % 100 == 0:
-                    progress(f"Processed {frame_number} MS1 frames")
+                    progress(f"Processed {frame_number}/{ms1_frames.size} MS1 frames")
 
     if worker_processes > 1:
         # Frame fetch+decompress (not this accumulation step) dominates wall time and is
@@ -1062,16 +1066,16 @@ def analyse(
             progress(f"Processing {ms1_frames.size} MS1 frames across {len(tasks)} workers")
         visited_total = 0
         with _worker_pool(len(tasks)) as pool:
-            for chunk_intensities, chunk_all_ms1, chunk_histograms, chunk_sampled, chunk_visited in pool.map(
-                _charge_region_chunk_worker, tasks
-            ):
+            futures = [pool.submit(_charge_region_chunk_worker, task) for task in tasks]
+            for future in as_completed(futures):
+                chunk_intensities, chunk_all_ms1, chunk_histograms, chunk_sampled, chunk_visited = future.result()
                 intensities += chunk_intensities
                 all_ms1_intensities += chunk_all_ms1
                 event_histograms += chunk_histograms
                 sampled_scans += chunk_sampled
                 visited_total += chunk_visited
-        if progress is not None:
-            progress(f"Processed {ms1_frames.size} MS1 frames")
+                if progress is not None:
+                    progress(f"Processed {visited_total}/{ms1_frames.size} MS1 frames")
 
     raw_event_intensity_histogram = event_histograms.sum(axis=0, dtype=np.uint64)
     if progress is not None:
